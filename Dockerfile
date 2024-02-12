@@ -1,9 +1,9 @@
-FROM python:3.9-alpine
+FROM python:3.7-alpine
 
 ARG CLI_VERSION=1.16.312
 
 RUN apk -uv add --no-cache groff jq less && \
-    pip install --no-cache-dir awscli==$CLI_VERSION urllib3 six
+    pip install --no-cache-dir awscli==$CLI_VERSION
 
 WORKDIR /aws
 
