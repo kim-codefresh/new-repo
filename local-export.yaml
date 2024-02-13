@@ -1,7 +1,7 @@
 version: '1.0'
 kind: pipeline
 metadata:
-  name: default/cf_export test
+  name: default/cf export
   project: default
   projectId: 657ff3abb9ebad19b6d7c5bd
   accountId: 657ff37d7aeb9c3ae0afcf0e
