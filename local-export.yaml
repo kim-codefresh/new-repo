@@ -3,6 +3,7 @@ kind: pipeline
 metadata:
   name: default/cf export
   project: default
+  isPublic: false
   projectId: 657ff3abb9ebad19b6d7c5bd
   accountId: 657ff37d7aeb9c3ae0afcf0e
   shortName: cf_export test
