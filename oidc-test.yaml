@@ -1,0 +1,50 @@
+version: '1.0'
+kind: pipeline
+metadata:
+  name: default/test-oidc
+  project: default
+  projectId: 6110d81fb902bae1ccf1c982
+  revision: 29
+  accountId: 6107f96b1895b556b7835b26
+  created_at: '2024-01-10T13:09:54.105Z'
+  updated_at: '2024-02-12T14:51:28.169Z'
+  shortName: test-oidc
+  deprecate: {}
+  labels:
+    tags: []
+  originalYamlString: |-
+    version: '1.0'
+    steps:
+      test_base_image:
+        title: test base image
+        image: quay.io/codefreshplugins/aws-cli:1.2.0-oidc-utils
+        # image: kimaharfi/new-repo:1.0.6
+        # image: mikesir87/aws-cli:1.16.284
+        commands:
+          - python --version
+          - aws --help
+          # - aws sts assume-role-with-web-identity \
+          #       --role-arn "$ROLE_ARN" \
+          #       --role-session-name "$ROLE_SESSION_NAME" \
+          #       --web-identity-token "$TOKEN" \
+          #       --output json \
+          #       --query Credentials
+  id: 659e9722192c8678ffe84e4c
+spec:
+  triggers: []
+  permitRestartFromFailedSteps: false
+  stages: []
+  clustersInfo:
+    injectAll: true
+    clusters: []
+  variables: []
+  contexts: []
+  terminationPolicy: []
+  externalResources: []
+  steps:
+    test_base_image:
+      title: test base image
+      image: 'quay.io/codefreshplugins/aws-cli:1.2.0-oidc-utils'
+      commands:
+        - python --version
+        - aws --help
