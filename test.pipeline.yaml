@@ -1,7 +1,7 @@
 version: '1.0'
 kind: pipeline
 metadata:
-  name: default/testt
+  name: default/test
   project: default
   projectId: 660be68fa311889d6489fc9c
   revision: 2
@@ -61,7 +61,7 @@ spec:
   specTemplate:
     location: git
     repo: kim-codefresh/pipelines
-    path: ./test.yaml
+    path: ./default/test.yaml
     revision: main
     context: github
   steps:
