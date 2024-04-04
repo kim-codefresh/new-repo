@@ -61,8 +61,8 @@ spec:
   specTemplate:
     location: git
     repo: kim-codefresh/pipelines
-    path: ./default/testt.yaml
-    revision: main
+    path: ./testt.yaml
+    revision: master
     context: github
   steps:
     clone:
