@@ -1,7 +1,7 @@
 version: '1.0'
 kind: pipeline
 metadata:
-  name: default/test
+  name: default/testt
   project: default
   projectId: 660be68fa311889d6489fc9c
   revision: 2
