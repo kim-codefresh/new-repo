@@ -1,0 +1,4097 @@
+---
+version: "1.0"
+stages:
+- git-clone
+- analysis
+- org-bootstrapper
+- am
+- ldif-importer
+- am-config-upgrader
+- am-keystore-copy
+- idm
+- idm-pre-idc
+- ctsstore
+- userstore
+- org-filter
+- haproxy
+- edgedelta
+- gatekeeper
+- intezer
+- keystores-create
+- kube-state-metrics
+- mon-identities-exporter
+- mon-metadata-exporter
+- mon-pingdom-exporter
+- prometheus
+- prometheus-blackbox-exporter
+- prometheus-json-exporter
+- prometheus-node-exporter
+- prometheus-stackdriver-exporter
+- kube-state-metrics
+- gatekeeper
+- thanos
+- util
+- workload-identity-init
+- platform-ui
+- auto-environment
+- common
+- backup-platform
+- org-orch-agent
+- config-loader
+- org-log-spewer
+- config-saver
+- patch-config
+- org-environment
+- org-esv
+- org-promo
+- cert-manager
+- unlock-liquibase
+- push-gateway
+- org-engine-binary
+- org-engine
+- diagnostics
+services:
+  name: services
+  composition:
+    datastore-emulator:
+      image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/datastore-emulator
+      ports:
+      - 8081
+hooks:
+  on_fail:
+    exec:
+      image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/curlimages/curl@sha256:2bad91c2be32091ca6beaa97a526ed044bf746b5d1d695158297a6b6f6e08640
+      commands:
+      - "if [[ \"${{CF_BRANCH}}\" != \"master\" ]]; then exit 0; fi"
+      - >- # Tell @cloud-devx in #fraas-build that customer-environment has failed to build `master`
+        curl --http1.1
+        -H "Authorization: Bearer ${{SLACK_ACCESS_TOKEN}}"
+        -H 'Content-type: application/json'
+        --data '{"channel": "C9QN94HDK",
+        "thread_ts": "",
+        "type": "mrkdwn",
+        "text": "<!subteam^S04UXSGS5PC> <${{CF_BUILD_URL}}|customer-environment build ${{CF_BUILD_ID}}> has failed on
+        `${{CF_BRANCH}}`\n
+        Commit ${{CF_REVISION}} by ${{CF_COMMIT_AUTHOR}}",
+        "reply_broadcast": "false"}'
+        "https://slack.com/api/chat.postMessage"
+mode: parallel
+steps:
+  #
+  # git-clone steps
+  #
+  main_clone:
+    title: Clone git repos
+    type: parallel
+    stage: git-clone
+    no_cache: false
+    no_cf_cache: true
+    steps:
+      # https://codefresh.io/docs/docs/codefresh-yaml/steps/git-clone/
+      saas_clone:
+        type: git-clone
+        title: Clone saas mono-repo
+        repo: ${{CF_REPO_OWNER}}/${{CF_REPO_NAME}}
+        revision: ${{CF_REVISION}}
+        git: github-app
+      main_clone_platform_images:
+        title: Clone platform-images repo
+        type: git-clone
+        repo: https://stash.forgerock.org/scm/cloud/platform-images.git
+        # WARNING: revision should not be set manually.
+        # To "upgrade" to a later release, see go/common/pkg/identityupdate
+        revision: "ce6d2a7b98a1f00708587e90596b2a8bc3fc26ec"
+        git: bitbucket-server
+      # Prune any reflog entries that point to an unreachable commit or refer to a missing object
+      main_prune_platform_images:
+        title: Prune Reflogs for platform-images
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+        commands:
+        - apk --no-cache add git
+        - test -d ${CF_VOLUME_PATH}/platform-images/.git 2>/dev/null && git --git-dir=${CF_VOLUME_PATH}/platform-images/.git reflog expire --all --stale-fix || true
+      export_variables:
+        title: Export variables
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/codefresh/cli@sha256:edf3baa42bf28c4bf5bada5f8570669897d20355ba644670364fbd621101724c # codefresh/cli
+        commands:
+        - cf_export GOMODCACHE=/codefresh/volume/.gomodcache
+        - cf_export GOCACHE=/codefresh/volume/.gocache
+        - cf_export KUBECTL_VERSION=v1.28.4
+  # Identify the Docker tags to use for workloads deployed by org-engine and decide which, if any, need to be rebuilt
+  GenerateBuildPlan:
+    title: Generate build plan
+    stage: analysis
+    retry:
+      maxAttempts: 2
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/gcloud-tools:1.21.1-alpine3.18@sha256:6d20cb9707813d003e29ab892d46d21ef7fbad537e91daa42ecef4571cc45951
+    # This step cannot be cached as it updates template helm files packaged by org-engine.
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    commands:
+    - gcloud config set component_manager/disable_update_check true
+    - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+    - gcloud auth activate-service-account codefresh-read-account@fr-pre-prod-registry.iam.gserviceaccount.com --key-file=/tmp/registry-read-key.json
+    - gcloud auth configure-docker us-docker.pkg.dev --quiet
+    - deploy/bin/customer-environment-build-plan.sh
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
+  #
+  # Org Bootstrapper steps
+  #
+  # Build unit test environment
+  # Create a simple image containing the Go runtime, org-bootstrapper source, and any needed files and environment variables
+  #
+  OrgBootstrapperUnitTestImage:
+    title: Building unit test environment
+    stage: org-bootstrapper
+    retry:
+      maxAttempts: 2
+    type: build
+    description: Docker image for conducting unit tests
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/org-bootstrapper/Dockerfile
+    target: source
+    image_name: org-bootstrapper
+    tag: ${{CF_BRANCH}}
+    buildkit: true
+    no_cache: false
+    no_cf_cache: true
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_BOOTSTRAPPER}}' == 'true'"
+  OrgBootstrapperTest:
+    type: parallel
+    stage: org-bootstrapper
+    title: Run unit tests
+    no_cache: false
+    no_cf_cache: true
+    steps:
+      UnitTest:
+        title: Unit Tests
+        image: ${{OrgBootstrapperUnitTestImage}}
+        working_directory: /codefresh/volume/saas/go/services/org-bootstrapper
+        commands:
+        - go test -p 1 ./...
+        on_success:
+          metadata:
+            set:
+            - ${{OrgBootstrapperUnitTestImage.imageId}}:
+              - CF_QUALITY: true
+        on_fail:
+          metadata:
+            set:
+            - ${{OrgBootstrapperUnitTestImage.imageId}}:
+              - CF_QUALITY: false
+    when:
+      steps:
+      - name: OrgBootstrapperUnitTestImage
+        on:
+        - success
+  #
+  # If unit tests passed, build an image
+  #
+  OrgBootstrapperImage:
+    title: Building image
+    stage: org-bootstrapper
+    retry:
+      maxAttempts: 2
+    type: build
+    description: Container image build
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/org-bootstrapper/Dockerfile
+    image_name: org-bootstrapper
+    tag: '${{STATIC_IMAGE_TAG}}'
+    buildkit: true
+    no_cache: false
+    no_cf_cache: true
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    - KUBECTL_VERSION=${{KUBECTL_VERSION}}
+    when:
+      steps:
+      - name: OrgBootstrapperTest
+        on:
+        - success
+  #
+  # Tag the image with the branch name and push to production repo
+  #
+  OrgBootstrapperToRegistryAmerica: &org_boostrapper_registry_push
+    title: Push to Artifact Registry
+    stage: org-bootstrapper
+    type: push
+    image_name: fr-pre-prod-registry/container-images/org-bootstrapper
+    candidate: '${{OrgBootstrapperImage}}'
+    retry:
+      maxAttempts: 2
+    tags:
+    - '${{STATIC_IMAGE_TAG}}'
+    - '${{FLOATING_IMAGE_TAG}}'
+    - '${{ORG_BOOTSTRAPPER_TAG}}'
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: OrgBootstrapperImage
+        on:
+        - success
+  OrgBootstrapperToRegistryEurope:
+    <<: *org_boostrapper_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-bootstrapper
+    registry: fr-pre-prod-registry-emea
+  OrgBootstrapperToRegistryAsia:
+    <<: *org_boostrapper_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-bootstrapper
+    registry: fr-pre-prod-registry-asia
+  OrgBootstrapperStageCompleted:
+    title: Completed
+    stage: org-bootstrapper
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    no_cache: false
+    no_cf_cache: true
+    commands:
+    - echo "Docker tag=${{ORG_BOOTSTRAPPER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.OrgBootstrapperToRegistryAmerica.result == 'success' ) && ( steps.OrgBootstrapperToRegistryEurope.result == 'success' ) && ( steps.OrgBootstrapperToRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_BOOTSTRAPPER}}' == 'false'"
+  #
+  # AM steps
+  #
+  PrepareAmIdentityPaasArgs:
+    title: Build Arguments
+    stage: am
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    commands:
+    - cf_export ACCESS_AI_NODES_GROUPID=$(cat services/forgecloud/customer/identity-paas/am/access-ai-nodes.pom | grep '<groupId>' | sed -r 's/(.*[>])([^<]+)([<].*)/\2/g' | tr "." "/")
+    - cf_export ACCESS_AI_NODES_ARTIFACTID=$(cat services/forgecloud/customer/identity-paas/am/access-ai-nodes.pom | grep '<artifactId>' | sed -r 's/(.*[>])([^<]+)([<].*)/\2/g')
+    - cf_export ACCESS_AI_NODES_VERSION=$(cat services/forgecloud/customer/identity-paas/am/access-ai-nodes.pom | grep '<version>' | sed -r 's/(.*[>])([^<]+)([<].*)/\2/g')
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM}}' == 'true'"
+  BuildMavenImage:
+    title: Build maven environment
+    stage: am
+    type: build
+    registry: fr-pre-prod-registry-artifact-registry-write
+    image_name: fr-pre-prod-registry/container-images/maven-environment
+    tag: latest
+    working_directory: /codefresh/volume/saas/deploy/docker/maven-environment
+    no_cache: false
+    no_cf_cache: true
+    build_arguments:
+    - ARTIFACTORY_USERNAME=${{ARTIFACTORY_USERNAME}}
+    - ARTIFACTORY_PASSWORD=${{ARTIFACTORY_PASSWORD}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM}}' == 'true'"
+  BuildAmIdentityPaasDeployImage:
+    title: Deployment image
+    stage: am
+    retry:
+      maxAttempts: 2
+    type: build
+    buildkit: true
+    image_name: am
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: services/forgecloud/customer/identity-paas/am/Dockerfile
+    tag: ${{AM_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    - ARTIFACTORY_API_KEY=${{ARTIFACTORY_API_KEY}}
+    - ACCESS_AI_NODES_GROUPID=${{ACCESS_AI_NODES_GROUPID}}
+    - ACCESS_AI_NODES_ARTIFACTID=${{ACCESS_AI_NODES_ARTIFACTID}}
+    - ACCESS_AI_NODES_VERSION=${{ACCESS_AI_NODES_VERSION}}
+    when:
+      steps:
+      - name: PrepareAmIdentityPaasArgs
+        on:
+        - success
+      - name: BuildMavenImage
+        on:
+        - success
+  PushAmIdentityPaasToDockerRegistryAmerica: &am_registry_push
+    title: Push to Artifact Registry
+    stage: am
+    type: push
+    image_name: fr-pre-prod-registry/container-images/am
+    candidate: ${{BuildAmIdentityPaasDeployImage}}
+    tags:
+    - ${{AM_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildAmIdentityPaasDeployImage
+        on:
+        - success
+  PushAmIdentityPaasToDockerRegistryEurope:
+    <<: *am_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/am
+    registry: fr-pre-prod-registry-emea
+  PushAmIdentityPaasToDockerRegistryAsia:
+    <<: *am_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/am
+    registry: fr-pre-prod-registry-asia
+  AmIdentityPaasStageCompleted:
+    title: Completed
+    stage: am
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{AM_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushAmIdentityPaasToDockerRegistryAmerica.result == 'success' ) && ( steps.PushAmIdentityPaasToDockerRegistryEurope.result == 'success' ) && ( steps.PushAmIdentityPaasToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_AM}}' == 'false'"
+  #
+  # AM-CONFIG-UPGRADER
+  #
+  BuildAMConfigUpgraderDeployImage:
+    title: Deployment image
+    stage: am-config-upgrader
+    retry:
+      maxAttempts: 2
+    type: build
+    buildkit: true
+    image_name: am-config-upgrader
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/shared/am-config-upgrader
+    dockerfile: Dockerfile
+    tag: ${{AM_CONFIG_UPGRADER_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM_CONFIG_UPGRADER}}' == 'true'"
+  PushAMConfigUpgraderDockerRegistryAmerica: &am_config_upgrader_registry_push
+    title: Push to Artifact Registry
+    stage: am-config-upgrader
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/am-config-upgrader
+    candidate: ${{BuildAMConfigUpgraderDeployImage}}
+    tags:
+    - ${{AM_CONFIG_UPGRADER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildAMConfigUpgraderDeployImage
+        on:
+        - success
+  PushAMConfigUpgraderDockerRegistryEurope:
+    <<: *am_config_upgrader_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/am-config-upgrader
+    registry: fr-pre-prod-registry-emea
+  PushAMConfigUpgraderDockerRegistryAsia:
+    <<: *am_config_upgrader_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/am-config-upgrader
+    registry: fr-pre-prod-registry-asia
+  AMConfigUpgraderStageCompleted:
+    title: Completed
+    stage: am-config-upgrader
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{AM_CONFIG_UPGRADER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushAMConfigUpgraderDockerRegistryAmerica.result == 'success' ) && ( steps.PushAMConfigUpgraderDockerRegistryEurope.result == 'success' ) && ( steps.PushAMConfigUpgraderDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_AM_CONFIG_UPGRADER}}' == 'false'"
+  #
+  # AM-KEYSTORE-COPY
+  #
+  BuildAMKeystoreCopyDeployImage:
+    title: Deployment image
+    stage: am-keystore-copy
+    retry:
+      maxAttempts: 2
+    type: build
+    buildkit: true
+    image_name: am-keystore-copy
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/identity-paas/am-keystore-copy
+    dockerfile: Dockerfile
+    tag: ${{AM_KEYSTORE_COPY_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM_KEYSTORE_COPY}}' == 'true'"
+  PushAMKeystoreCopyDockerRegistryAmerica: &am_keystore_copy_registry_push
+    title: Push to Artifact Registry
+    stage: am-keystore-copy
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/am-keystore-copy
+    candidate: ${{BuildAMKeystoreCopyDeployImage}}
+    tags:
+    - ${{AM_KEYSTORE_COPY_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildAMKeystoreCopyDeployImage
+        on:
+        - success
+  PushAMKeystoreCopyDockerRegistryEurope:
+    <<: *am_keystore_copy_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/am-keystore-copy
+    registry: fr-pre-prod-registry-emea
+  PushAMKeystoreCopyDockerRegistryAsia:
+    <<: *am_keystore_copy_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/am-keystore-copy
+    registry: fr-pre-prod-registry-asia
+  AMKeystoreCopyStageCompleted:
+    title: Completed
+    stage: am-keystore-copy
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{AM_KEYSTORE_COPY_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushAMKeystoreCopyDockerRegistryAmerica.result == 'success' ) && ( steps.PushAMKeystoreCopyDockerRegistryEurope.result == 'success' ) && ( steps.PushAMKeystoreCopyDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_AM_KEYSTORE_COPY}}' == 'false'"
+  #
+  # keystores-create
+  #
+  BuildKeystoresCreateDeployImage:
+    title: Deployment image
+    stage: keystores-create
+    retry:
+      maxAttempts: 2
+    type: build
+    buildkit: true
+    image_name: keystores-create
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/keystores-create/Dockerfile
+    tag: ${{KEYSTORES_CREATE_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_KEYSTORES_CREATE}}' == 'true'"
+  PushKeystoresCreateDockerRegistryAmerica: &KEYSTORES_CREATE_registry_push
+    title: Push to Artifact Registry
+    stage: keystores-create
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/keystores-create
+    candidate: ${{BuildKeystoresCreateDeployImage}}
+    tags:
+    - ${{KEYSTORES_CREATE_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildKeystoresCreateDeployImage
+        on:
+        - success
+  PushKeystoresCreateDockerRegistryEurope:
+    <<: *KEYSTORES_CREATE_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/keystores-create
+    registry: fr-pre-prod-registry-emea
+  PushKeystoresCreateDockerRegistryAsia:
+    <<: *KEYSTORES_CREATE_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/keystores-create
+    registry: fr-pre-prod-registry-asia
+  KeystoresCreateStageCompleted:
+    title: Completed
+    stage: keystores-create
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{KEYSTORES_CREATE_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushKeystoresCreateDockerRegistryAmerica.result == 'success' ) && ( steps.PushKeystoresCreateDockerRegistryEurope.result == 'success' ) && ( steps.PushKeystoresCreateDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_KEYSTORES_CREATE}}' == 'false'"
+  #
+  # LDIF Importer steps
+  #
+  BuildLdifImporterDeployImage:
+    title: Deployment image
+    stage: ldif-importer
+    retry:
+      maxAttempts: 2
+    type: build
+    buildkit: true
+    image_name: ldif-importer
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/shared/ldif-importer
+    dockerfile: Dockerfile
+    tag: ${{LDIF_IMPORTER_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_LDIF_IMPORTER}}' == 'true'"
+  PushLdifImporterToDockerRegistryAmerica: &ldif_importer_registry_push
+    title: Push to Artifact Registry
+    stage: ldif-importer
+    retry:
+      maxAttempts: 2
+    type: push
+    image_name: fr-pre-prod-registry/container-images/ldif-importer
+    candidate: ${{BuildLdifImporterDeployImage}}
+    tags:
+    - ${{LDIF_IMPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildLdifImporterDeployImage
+        on:
+        - success
+  PushLdifImporterToDockerRegistryEurope:
+    <<: *ldif_importer_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/ldif-importer
+    registry: fr-pre-prod-registry-emea
+  PushLdifImporterToDockerRegistryAsia:
+    <<: *ldif_importer_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/ldif-importer
+    registry: fr-pre-prod-registry-asia
+  LdifImporterStageCompleted:
+    title: Completed
+    stage: ldif-importer
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{LDIF_IMPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushLdifImporterToDockerRegistryAmerica.result == 'success' ) && ( steps.PushLdifImporterToDockerRegistryEurope.result == 'success' ) && ( steps.PushLdifImporterToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_LDIF_IMPORTER}}' == 'false'"
+  #
+  # IDM steps
+  #
+  BuildIdmIdentityPaasDeployImage:
+    title: Deployment image
+    stage: idm
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: idm
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: services/forgecloud/customer/identity-paas/idm/Dockerfile
+    tag: ${{IDM_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_IDM}}' == 'true'"
+  PushIdmIdentityPaasToDockerRegistryAmerica: &idm_registry_push
+    title: Push to Artifact Registry
+    stage: idm
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/idm
+    candidate: ${{BuildIdmIdentityPaasDeployImage}}
+    tags:
+    - ${{IDM_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildIdmIdentityPaasDeployImage
+        on:
+        - success
+  PushIdmIdentityPaasToDockerRegistryEurope:
+    <<: *idm_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/idm
+    registry: fr-pre-prod-registry-emea
+  PushIdmIdentityPaasToDockerRegistryAsia:
+    <<: *idm_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/idm
+    registry: fr-pre-prod-registry-asia
+  IdmIdentityPaasStageCompleted:
+    title: Completed
+    stage: idm
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{IDM_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushIdmIdentityPaasToDockerRegistryAmerica.result == 'success' ) && ( steps.PushIdmIdentityPaasToDockerRegistryEurope.result == 'success' ) && ( steps.PushIdmIdentityPaasToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_IDM}}' == 'false'"
+  #
+  # IDM steps
+  #
+  BuildIdmIdentityPaasPreIdcDeployImage:
+    title: Deployment image
+    stage: idm-pre-idc
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: idm-pre-idc
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: services/forgecloud/customer/identity-paas/idm-pre-idc/Dockerfile
+    tag: ${{IDM_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_IDM}}' == 'true'"
+  PushIdmIdentityPaasPreIdcToDockerRegistryAmerica: &idm_pre_idc_registry_push
+    title: Push to Artifact Registry
+    stage: idm-pre-idc
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/idm-pre-idc
+    candidate: ${{BuildIdmIdentityPaasPreIdcDeployImage}}
+    tags:
+    - ${{IDM_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildIdmIdentityPaasPreIdcDeployImage
+        on:
+        - success
+  PushIdmIdentityPaasPreIdcToDockerRegistryEurope:
+    <<: *idm_pre_idc_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/idm-pre-idc
+    registry: fr-pre-prod-registry-emea
+  PushIdmIdentityPaasPreIdcToDockerRegistryAsia:
+    <<: *idm_pre_idc_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/idm-pre-idc
+    registry: fr-pre-prod-registry-asia
+  IdmIdentityPaasPreIdcStageCompleted:
+    title: Completed
+    stage: idm-pre-idc
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{IDM_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushIdmIdentityPaasPreIdcToDockerRegistryAmerica.result == 'success' ) && ( steps.PushIdmIdentityPaasPreIdcToDockerRegistryEurope.result == 'success' ) && ( steps.PushIdmIdentityPaasPreIdcToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_IDM}}' == 'false'"
+  #
+  # CTS Store steps Common
+  #
+  BuildCtsStoreDeployImage:
+    title: Deployment image
+    stage: ctsstore
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: ctsstore
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/shared/ctsstore/
+    dockerfile: Dockerfile
+    tag: ${{CTSSTORE_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_CTSSTORE}}' == 'true'"
+  PushCtsStoreToDockerRegistryAmerica: &ctsstore_registry_push
+    title: Push to Artifact Registry
+    stage: ctsstore
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/ctsstore
+    candidate: ${{BuildCtsStoreDeployImage}}
+    tags:
+    - ${{CTSSTORE_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildCtsStoreDeployImage
+        on:
+        - success
+  PushCtsStoreToDockerRegistryEurope:
+    <<: *ctsstore_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/ctsstore
+    registry: fr-pre-prod-registry-emea
+  PushCtsStoreToDockerRegistryAsia:
+    <<: *ctsstore_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/ctsstore
+    registry: fr-pre-prod-registry-asia
+  CtsStoreStageCompleted:
+    title: Completed
+    stage: ctsstore
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{CTSSTORE_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushCtsStoreToDockerRegistryAmerica.result == 'success' ) && ( steps.PushCtsStoreToDockerRegistryEurope.result == 'success' ) && ( steps.PushCtsStoreToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_CTSSTORE}}' == 'false'"
+  #
+  # User Store steps
+  #
+  BuildUserStoreIdentityPaasDeployImage:
+    title: Deployment image
+    stage: userstore
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: userstore
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/identity-paas/userstore/
+    dockerfile: Dockerfile
+    tag: ${{USERSTORE_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_USERSTORE}}' == 'true'"
+  PushUserStoreIdentityPaasToDockerRegistryAmerica: &userstore_registry_push
+    title: Push to Artifact Registry
+    stage: userstore
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/userstore
+    candidate: ${{BuildUserStoreIdentityPaasDeployImage}}
+    tags:
+    - ${{USERSTORE_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildUserStoreIdentityPaasDeployImage
+        on:
+        - success
+  PushUserStoreIdentityPaasToDockerRegistryEurope:
+    <<: *userstore_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/userstore
+    registry: fr-pre-prod-registry-emea
+  PushUserStoreIdentityPaasToDockerRegistryAsia:
+    <<: *userstore_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/userstore
+    registry: fr-pre-prod-registry-asia
+  UserStoreIdentityPaasStageCompleted:
+    title: Completed
+    stage: userstore
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{USERSTORE_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushUserStoreIdentityPaasToDockerRegistryAmerica.result == 'success' ) && ( steps.PushUserStoreIdentityPaasToDockerRegistryEurope.result == 'success' ) && ( steps.PushUserStoreIdentityPaasToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_USERSTORE}}' == 'false'"
+  #
+  # common steps
+  #
+  BuildCommonTestImage:
+    title: Test image
+    stage: common
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: common-test
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/common/docker/Dockerfile-test
+    tag: ${{FLOATING_IMAGE_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_COMMON}}' == 'true'"
+  TestCommon:
+    type: parallel
+    stage: common
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunCommonIntegrationTests:
+        title: Run Integration Tests
+        description: Run common integration tests
+        image: ${{BuildCommonTestImage}}
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/common
+        services:
+        - datastore-emulator
+        environment:
+        - DATASTORE_EMULATOR_HOST=datastore-emulator:8081
+        # DATASTORE_EMULATOR_ENABLED controls whether the test suite starts up the emulator in the background
+        # Since we're using an external dockerized version of the emulator, we set this to false.
+        - DATASTORE_EMULATOR_ENABLED=false
+        - SAAS_PATH=/go/src/github.com/ForgeCloud/saas
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildCommonTestImage
+        on:
+        - success
+  # Common Docker image is not used by any deployments. The GenerateBuildPlan step checks for the presence
+  # of the Common Docker image with an appropriate tag in order to decide whether or not the common stage
+  # needs to be run during a given build.
+  PushCommonToDockerRegistryAmerica: &common_registry_push
+    title: Push to Artifact Registry
+    stage: common
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/common
+    candidate: ${{BuildCommonTestImage}}
+    tags:
+    - ${{COMMON_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: TestCommon
+        on:
+        - success
+  PushCommonToDockerRegistryEurope:
+    <<: *common_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/common
+    registry: fr-pre-prod-registry-emea
+  PushCommonToDockerRegistryAsia:
+    <<: *common_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/common
+    registry: fr-pre-prod-registry-asia
+  CommonStageCompleted:
+    title: Completed
+    stage: common
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{COMMON_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushCommonToDockerRegistryAmerica.result == 'success' ) && ( steps.PushCommonToDockerRegistryEurope.result == 'success' ) && ( steps.PushCommonToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_COMMON}}' == 'false'"
+  #
+  # backup-platform steps
+  #
+  BuildBackupPlatformUnitTestImage:
+    title: Test image
+    stage: backup-platform
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: backup-platform-build
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/backup-platform/Dockerfile
+    tag: ${{BACKUP_PLATFORM_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_BACKUP_PLATFORM}}' == 'true'"
+  TestBackupPlatform:
+    type: parallel
+    stage: backup-platform
+    title: Run unit tests
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    steps:
+      RunBackupPlatformUnitTests:
+        title: Run Unit Tests
+        stage: backup-platform
+        retry:
+          maxAttempts: 2
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/backup-platform
+        image: ${{BuildBackupPlatformUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildBackupPlatformUnitTestImage
+        on:
+        - success
+  BuildBackupPlatformDeployImage:
+    title: Deployment image
+    stage: backup-platform
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: backup-platform
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/backup-platform/Dockerfile
+    tag: ${{BACKUP_PLATFORM_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestBackupPlatform
+        on:
+        - success
+  PushBackupPlatformToDockerRegistryAmerica: &backup_platform_registry_path
+    title: Push to Artifact Registry
+    stage: backup-platform
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/backup-platform
+    candidate: ${{BuildBackupPlatformDeployImage}}
+    tags:
+    - ${{BACKUP_PLATFORM_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildBackupPlatformDeployImage
+        on:
+        - success
+  PushBackupPlatformToDockerRegistryEurope:
+    <<: *backup_platform_registry_path
+    image_name: fr-pre-prod-registry/container-images-emea/backup-platform
+    registry: fr-pre-prod-registry-emea
+  PushBackupPlatformToDockerRegistryAsia:
+    <<: *backup_platform_registry_path
+    image_name: fr-pre-prod-registry/container-images-apac/backup-platform
+    registry: fr-pre-prod-registry-asia
+  BackupPlatformStageCompleted:
+    title: Completed
+    stage: backup-platform
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{BACKUP_PLATFORM_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushBackupPlatformToDockerRegistryAmerica.result == 'success' ) && ( steps.PushBackupPlatformToDockerRegistryEurope.result == 'success' ) && ( steps.PushBackupPlatformToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_BACKUP_PLATFORM}}' == 'false'"
+  #
+  # org-orch-agent steps
+  #
+  OrgOrchAgentUnitTestImage:
+    title: Test image
+    stage: org-orch-agent
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-orch-agent-test
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-orch-agent/Dockerfile
+    tag: ${{ORG_ORCH_AGENT_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ORCH_AGENT}}' == 'true'"
+  TestOrgOrchAgent:
+    type: parallel
+    stage: org-orch-agent
+    title: Run unit tests
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    steps:
+      RunOrgOrchAgentUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-orch-agent
+        image: ${{OrgOrchAgentUnitTestImage}}
+        commands:
+        # This breaks with the chmod
+        - unset GOMODCACHE
+        - unset GOCACHE
+        - chown -R tester:test /go
+        - su -c "go test -p 1 ./..." tester
+    when:
+      steps:
+      - name: OrgOrchAgentUnitTestImage
+        on:
+        - success
+  BuildOrgOrchAgentDeployImage:
+    title: Deployment image
+    stage: org-orch-agent
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-orch-agent
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-orch-agent/Dockerfile
+    tag: ${{ORG_ORCH_AGENT_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestOrgOrchAgent
+        on:
+        - success
+  PushOrgOrchAgentToDockerRegistryAmerica: &org_orch_agent_registry_push
+    title: Push to Artifact Registry
+    stage: org-orch-agent
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-orch-agent
+    candidate: ${{BuildOrgOrchAgentDeployImage}}
+    tags:
+    - ${{ORG_ORCH_AGENT_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildOrgOrchAgentDeployImage
+        on:
+        - success
+  PushOrgOrchAgentToDockerRegistryEurope:
+    <<: *org_orch_agent_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-orch-agent
+    registry: fr-pre-prod-registry-emea
+  PushOrgOrchAgentToDockerRegistryAsia:
+    <<: *org_orch_agent_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-orch-agent
+    registry: fr-pre-prod-registry-asia
+  OrgOrchAgentStageCompleted:
+    title: Completed
+    stage: org-orch-agent
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_ORCH_AGENT_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushOrgOrchAgentToDockerRegistryAmerica.result == 'success' ) && ( steps.PushOrgOrchAgentToDockerRegistryEurope.result == 'success' ) && ( steps.PushOrgOrchAgentToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_ORCH_AGENT}}' == 'false'"
+  #
+  # config-loader steps
+  #
+  LoaderUnitTestImage:
+    title: Test image
+    stage: config-loader
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: config-loader-test
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/config-loader/Dockerfile
+    tag: ${{CONFIG_LOADER_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_CONFIG_LOADER}}' == 'true'"
+  TestLoader:
+    type: parallel
+    stage: config-loader
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunLoaderUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/config-loader
+        image: ${{LoaderUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: LoaderUnitTestImage
+        on:
+        - success
+  BuildLoaderDeployImage:
+    title: Deployment image
+    stage: config-loader
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: config-loader
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/config-loader/Dockerfile
+    tag: ${{CONFIG_LOADER_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestLoader
+        on:
+        - success
+  PushLoaderToDockerRegistryAmerica: &config_loader_registry_push
+    title: Push to Artifact Registry
+    stage: config-loader
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/config-loader
+    candidate: ${{BuildLoaderDeployImage}}
+    tags:
+    - ${{CONFIG_LOADER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildLoaderDeployImage
+        on:
+        - success
+  PushLoaderToDockerRegistryEurope:
+    <<: *config_loader_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/config-loader
+    registry: fr-pre-prod-registry-emea
+  PushLoaderToDockerRegistryAsia:
+    <<: *config_loader_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/config-loader
+    registry: fr-pre-prod-registry-asia
+  ConfigLoaderStageCompleted:
+    title: Completed
+    stage: config-loader
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{CONFIG_LOADER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushLoaderToDockerRegistryAmerica.result == 'success' ) && ( steps.PushLoaderToDockerRegistryEurope.result == 'success' ) && ( steps.PushLoaderToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_CONFIG_LOADER}}' == 'false'"
+  #
+  # unlock-liquibase steps
+  #
+  UnlockLiquibaseUnitTestImage:
+    title: Test image
+    stage: unlock-liquibase
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: unlock-liquibase-test
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/unlock-liquibase/Dockerfile
+    tag: ${{UNLOCK_LIQUIBASE_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_UNLOCK_LIQUIBASE}}' == 'true'"
+  TestUnlockLiquibase:
+    type: parallel
+    stage: unlock-liquibase
+    title: Run unit tests
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    steps:
+      RunUnlockLiquibaseUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/unlock-liquibase
+        image: ${{UnlockLiquibaseUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: UnlockLiquibaseUnitTestImage
+        on:
+        - success
+  BuildUnlockLiquibaseDeployImage:
+    title: Deployment image
+    stage: unlock-liquibase
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: unlock-liquibase
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/unlock-liquibase/Dockerfile
+    tag: ${{UNLOCK_LIQUIBASE_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestUnlockLiquibase
+        on:
+        - success
+  PushUnlockLiquibaseToDockerRegistryAmerica: &unlock_liquibase_registry_push
+    title: Push to Artifact Registry
+    stage: unlock-liquibase
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/unlock-liquibase
+    candidate: ${{BuildUnlockLiquibaseDeployImage}}
+    tags:
+    - ${{UNLOCK_LIQUIBASE_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildUnlockLiquibaseDeployImage
+        on:
+        - success
+  PushUnlockLiquibaseToDockerRegistryEurope:
+    <<: *unlock_liquibase_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/unlock-liquibase
+    registry: fr-pre-prod-registry-emea
+  PushUnlockLiquibaseToDockerRegistryAsia:
+    <<: *unlock_liquibase_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/unlock-liquibase
+    registry: fr-pre-prod-registry-asia
+  UnlockLiquibaseStageCompleted:
+    title: Completed
+    stage: unlock-liquibase
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{UNLOCK_LIQUIBASE_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushUnlockLiquibaseToDockerRegistryAmerica.result == 'success' ) && ( steps.PushUnlockLiquibaseToDockerRegistryEurope.result == 'success' ) && ( steps.PushUnlockLiquibaseToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_UNLOCK_LIQUIBASE}}' == 'false'"
+  #
+  # org-log-spewer steps
+  #
+  BuildOrgLogSpewerUnitTestImage:
+    title: Test image
+    stage: org-log-spewer
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-log-spewer-build
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-log-spewer/Dockerfile
+    tag: ${{ORG_LOG_SPEWER_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_LOG_SPEWER}}' == 'true'"
+  TestOrgLogSpewer:
+    type: parallel
+    stage: org-log-spewer
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunOrgLogSpewerUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-log-spewer
+        image: ${{BuildOrgLogSpewerUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildOrgLogSpewerUnitTestImage
+        on:
+        - success
+  BuildOrgLogSpewerDeployImage:
+    title: Deployment image
+    stage: org-log-spewer
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-log-spewer
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-log-spewer/Dockerfile
+    tag: ${{ORG_LOG_SPEWER_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestOrgLogSpewer
+        on:
+        - success
+  PushOrgLogSpewerToDockerRegistryAmerica: &org_log_spewer_registry_push
+    title: Push to Artifact Registry
+    stage: org-log-spewer
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-log-spewer
+    candidate: ${{BuildOrgLogSpewerDeployImage}}
+    tags:
+    - ${{ORG_LOG_SPEWER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildOrgLogSpewerDeployImage
+        on:
+        - success
+  PushOrgLogSpewerToDockerRegistryEurope:
+    <<: *org_log_spewer_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-log-spewer
+    registry: fr-pre-prod-registry-emea
+  PushOrgLogSpewerToDockerRegistryAsia:
+    <<: *org_log_spewer_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-log-spewer
+    registry: fr-pre-prod-registry-asia
+  OrgLogSpewerStageCompleted:
+    title: Completed
+    stage: org-log-spewer
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_LOG_SPEWER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushOrgLogSpewerToDockerRegistryAmerica.result == 'success' ) && ( steps.PushOrgLogSpewerToDockerRegistryEurope.result == 'success' ) && ( steps.PushOrgLogSpewerToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_LOG_SPEWER}}' == 'false'"
+  BuildCertManagerImages:
+    title: Build Images
+    type: parallel
+    stage: cert-manager
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: ( '${{BUILD_CERT_MANAGER_CONTROLLER}}' == 'true' ) || ( '${{BUILD_CERT_MANAGER_CAINJECTOR}}' == 'true' ) || ( '${{BUILD_CERT_MANAGER_WEBHOOK}}' == 'true' )
+    steps:
+      BuildControllerDeployImage:
+        title: Build cert-manager Controller
+        stage: cert-manager
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: cert-manager-controller
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas/
+        dockerfile: 3rdparty/cert-manager/Dockerfile
+        tag: ${{CERT_MANAGER_CONTROLLER_TAG}}
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+      BuildWebhookDeployImage:
+        title: Build cert-manager webhook
+        stage: cert-manager
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: cert-manager-webhook
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas/
+        dockerfile: 3rdparty/cert-manager/webhook.Dockerfile
+        tag: ${{CERT_MANAGER_WEBHOOK_TAG}}
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+      BuildCainjectorDeployImage:
+        title: Build cert-manager cainjector
+        stage: cert-manager
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: cert-manager-cainjector
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas/
+        dockerfile: 3rdparty/cert-manager/cainjector.Dockerfile
+        tag: ${{CERT_MANAGER_CAINJECTOR_TAG}}
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+  PushCertManagerImages:
+    title: Push images
+    type: parallel
+    stage: cert-manager
+    when:
+      steps:
+      - name: BuildCertManagerImages
+        on:
+        - success
+    steps:
+      PushControllerToDockerRegistryAmerica: &controller_registry_push
+        title: Push cert-manager Controller Image in America
+        stage: cert-manager
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/cert-manager-controller
+        candidate: ${{BuildControllerDeployImage}}
+        tags:
+        - ${{CERT_MANAGER_CONTROLLER_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushControllerToDockerRegistryEurope:
+        <<: *controller_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/cert-manager-controller
+        registry: fr-pre-prod-registry-emea
+      PushControllerToDockerRegistryAsia:
+        <<: *controller_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/cert-manager-controller
+        registry: fr-pre-prod-registry-asia
+      PushWebhookToDockerRegistryAmerica: &webhook_registry_push
+        title: Push cert-manager webhook Image in America
+        stage: cert-manager
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/cert-manager-webhook
+        candidate: ${{BuildWebhookDeployImage}}
+        tags:
+        - ${{CERT_MANAGER_WEBHOOK_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushWebhookToDockerRegistryEurope:
+        <<: *webhook_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/cert-manager-webhook
+        registry: fr-pre-prod-registry-emea
+      PushWebhookToDockerRegistryAsia:
+        <<: *webhook_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/cert-manager-webhook
+        registry: fr-pre-prod-registry-asia
+      PushCainjectorToDockerRegistryAmerica: &cainjector_registry_push
+        title: Push cert-manager cainjector Image in America
+        stage: cert-manager
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/cert-manager-cainjector
+        candidate: ${{BuildCainjectorDeployImage}}
+        tags:
+        - ${{CERT_MANAGER_CAINJECTOR_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushCainjectorToDockerRegistryEurope:
+        <<: *cainjector_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/cert-manager-cainjector
+        registry: fr-pre-prod-registry-emea
+      PushCainjectorToDockerRegistryAsia:
+        <<: *cainjector_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/cert-manager-cainjector
+        registry: fr-pre-prod-registry-asia
+  CertManagerStageCompleted:
+    title: Completed
+    stage: cert-manager
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{CERT_MANAGER_CONTROLLER_TAG}}"
+    - echo "Docker tag=${{CERT_MANAGER_CAINJECTOR_TAG}}"
+    - echo "Docker tag=${{CERT_MANAGER_WEBHOOK_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.BuildCertManagerImages.result == 'success' ) && ( steps.PushCertManagerImages.result == 'success' )
+          skipBuild: ( '${{BUILD_CERT_MANAGER_CONTROLLER}}' == 'false' ) && ( '${{BUILD_CERT_MANAGER_CAINJECTOR}}' == 'false' ) && ( '${{BUILD_CERT_MANAGER_WEBHOOK}}' == 'false' )
+  #
+  # config-saver steps
+  #
+  SaverUnitTestImage:
+    title: Test image
+    stage: config-saver
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: config-saver-test
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/config-saver/saver.Dockerfile
+    tag: ${{CONFIG_SAVER_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_CONFIG_SAVER}}' == 'true'"
+  TestSaver:
+    type: parallel
+    stage: config-saver
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunSaverIntegrationTests:
+        title: Run Integration Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/config-saver
+        image: ${{SaverUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: SaverUnitTestImage
+        on:
+        - success
+  BuildImages:
+    title: Build Images
+    type: parallel
+    stage: config-saver
+    when:
+      steps:
+      - name: TestSaver
+        on:
+        - success
+    steps:
+      BuildSaverDeployImage:
+        title: Build Config Saver Image
+        stage: config-saver
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: config-saver
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas/
+        dockerfile: go/services/customer/config-saver/saver.Dockerfile
+        tag: ${{CONFIG_SAVER_TAG}}
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+      BuildCommitterDeployImage:
+        title: Build Config Committer Imager
+        stage: config-saver
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: config-committer
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas/
+        dockerfile: go/services/customer/config-saver/committer.Dockerfile
+        tag: ${{CONFIG_SAVER_TAG}}
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+  PushImages:
+    title: Push images
+    type: parallel
+    stage: config-saver
+    when:
+      steps:
+      - name: BuildImages
+        on:
+        - success
+    steps:
+      PushSaverToDockerRegistryAmerica: &config_saver_registry_push
+        title: Push Config Saver Image in America
+        stage: config-saver
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/config-saver
+        candidate: ${{BuildSaverDeployImage}}
+        tags:
+        - ${{CONFIG_SAVER_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushSaverToDockerRegistryEurope:
+        <<: *config_saver_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/config-saver
+        registry: fr-pre-prod-registry-emea
+      PushSaverToDockerRegistryAsia:
+        <<: *config_saver_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/config-saver
+        registry: fr-pre-prod-registry-asia
+      PushComitterToDockerRegistryAmerica: &config_comitter_registry_push
+        title: Push Config Committer Image in America
+        stage: config-saver
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/config-committer
+        candidate: ${{BuildCommitterDeployImage}}
+        tags:
+        - ${{CONFIG_SAVER_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushComitterToDockerRegistryEurope:
+        <<: *config_comitter_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/config-committer
+        registry: fr-pre-prod-registry-emea
+      PushComitterToDockerRegistryAsia:
+        <<: *config_comitter_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/config-committer
+        registry: fr-pre-prod-registry-asia
+  SaverStageCompleted:
+    title: Completed
+    stage: config-saver
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{CONFIG_SAVER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.BuildImages.result == 'success' ) && ( steps.PushImages.result == 'success' )
+          skipBuild: "'${{BUILD_CONFIG_SAVER}}' == 'false'"
+  #
+  # patch-config steps
+  #
+  BuildPatchConfigDeployImage:
+    title: PatchConfig deployment image
+    stage: patch-config
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: patch-config
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/identity-paas/patch-config
+    dockerfile: Dockerfile
+    tag: ${{PATCH_CONFIG_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PATCH_CONFIG}}' == 'true'"
+  PushPatchConfigToDockerRegistryAmerica: &patch_config_registry_push
+    title: Push to Artifact Registry
+    stage: patch-config
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/patch-config
+    candidate: ${{BuildPatchConfigDeployImage}}
+    tags:
+    - ${{PATCH_CONFIG_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPatchConfigDeployImage
+        on:
+        - success
+  PushPatchConfigToDockerRegistryEurope:
+    <<: *patch_config_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/patch-config
+    registry: fr-pre-prod-registry-emea
+  PushPatchConfigToDockerRegistryAsia:
+    <<: *patch_config_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/patch-config
+    registry: fr-pre-prod-registry-asia
+  PatchConfigStageCompleted:
+    title: Completed
+    stage: patch-config
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PATCH_CONFIG_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPatchConfigToDockerRegistryAmerica.result == 'success' ) && ( steps.PushPatchConfigToDockerRegistryEurope.result == 'success' ) && ( steps.PushPatchConfigToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_PATCH_CONFIG}}' == 'false'"
+  #
+  # org-filter steps
+  #
+  InstallOrgFilter:
+    type: parallel
+    stage: org-filter
+    no_cache: false
+    no_cf_cache: true
+    title: Install org-filter deps
+    retry:
+      maxAttempts: 2
+    steps:
+      InstallOrgFilterDeps:
+        title: Run Yarn InstallOrgFilterDeps
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/node@sha256:5264a83ba15b167cc077e1af520f673ff9d5d706f9f2c3d6c73cd41809d64436 # node:16.14.2-alpine3.14
+        working_directory: /codefresh/volume/saas/services/org-filter
+        environment:
+        - YARN_CACHE_FOLDER=/codefresh/volume/.yarn-cache
+        commands:
+        - yarn install --prefer-offline
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_FILTER}}' == 'true'"
+  LintTestOrgFilter:
+    type: parallel
+    stage: org-filter
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests and linters
+    retry:
+      maxAttempts: 2
+    steps:
+      LintOrgFilterSource:
+        title: Run Lint
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/node@sha256:5264a83ba15b167cc077e1af520f673ff9d5d706f9f2c3d6c73cd41809d64436 # node:16.14.2-alpine3.14
+        working_directory: /codefresh/volume/saas/services/org-filter
+        environment:
+        - YARN_CACHE_FOLDER=/codefresh/volume/.yarn-cache
+        commands:
+        - yarn lint
+      RunOrgFilterUnitTests:
+        title: Run Unit Tests
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/node@sha256:5264a83ba15b167cc077e1af520f673ff9d5d706f9f2c3d6c73cd41809d64436 # node:16.14.2-alpine3.14
+        working_directory: /codefresh/volume/saas/services/org-filter
+        environment:
+        - YARN_CACHE_FOLDER=/codefresh/volume/.yarn-cache
+        commands:
+        - yarn test
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_FILTER}}' == 'true'"
+          steps_success: steps.InstallOrgFilterDeps.result == 'success'
+  BuildOrgFilterDeployImage:
+    title: Build Deploy Image
+    stage: org-filter
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-filter
+    working_directory: /codefresh/volume/saas/services/org-filter
+    dockerfile: Dockerfile
+    tag: ${{ORG_FILTER_TAG}}
+    when:
+      steps:
+      - name: LintTestOrgFilter
+        on:
+        - success
+  PushOrgFilterToDockerRegistryAmerica: &org_filter_registry_push
+    title: Push to Artifact Registry
+    stage: org-filter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-filter
+    candidate: ${{BuildOrgFilterDeployImage}}
+    tags:
+    - ${{ORG_FILTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildOrgFilterDeployImage
+        on:
+        - success
+  PushOrgFilterToDockerRegistryEurope:
+    <<: *org_filter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-filter
+    registry: fr-pre-prod-registry-emea
+  PushOrgFilterToDockerRegistryAsia:
+    <<: *org_filter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-filter
+    registry: fr-pre-prod-registry-asia
+  OrgFilterStageCompleted:
+    title: Completed
+    stage: org-filter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_FILTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushOrgFilterToDockerRegistryAmerica.result == 'success' ) && ( steps.PushOrgFilterToDockerRegistryEurope.result == 'success' ) && ( steps.PushOrgFilterToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_FILTER}}' == 'false'"
+  #
+  # org-esv steps
+  #
+  BuildOrgEsvTestImage:
+    title: Test Image
+    stage: org-esv
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-esv
+    no_cache: false
+    no_cf_cache: true
+    target: source
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-esv/Dockerfile
+    tag: ${{ORG_ESV_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ESV}}' == 'true'"
+  TestOrgEsv:
+    type: parallel
+    stage: org-esv
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunOrgEsvUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-esv
+        no_cache: false
+        no_cf_cache: true
+        image: ${{BuildOrgEsvTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildOrgEsvTestImage
+        on:
+        - success
+  BuildOrgEsvDeployImage:
+    title: Deployment Image
+    stage: org-esv
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-esv
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-esv/Dockerfile
+    tag: ${{ORG_ESV_TAG}}
+    when:
+      steps:
+      - name: TestOrgEsv
+        on:
+        - success
+  PushOrgEsvToDockerRegistryAmerica: &org_esv_registry_push
+    title: Push to Artifact Registry
+    stage: org-esv
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-esv
+    candidate: ${{BuildOrgEsvDeployImage}}
+    tags:
+    - ${{ORG_ESV_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildOrgEsvDeployImage
+        on:
+        - success
+  PushOrgEsvToDockerRegistryEurope:
+    <<: *org_esv_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-esv
+    registry: fr-pre-prod-registry-emea
+  PushOrgEsvToDockerRegistryAsia:
+    <<: *org_esv_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-esv
+    registry: fr-pre-prod-registry-asia
+  OrgEsvStageCompleted:
+    title: Completed
+    stage: org-esv
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_ESV_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushOrgEsvToDockerRegistryAmerica.result == 'success' ) && ( steps.PushOrgEsvToDockerRegistryEurope.result == 'success' ) && ( steps.PushOrgEsvToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_ESV}}' == 'false'"
+  #
+  # org-environment steps
+  #
+  BuildOrgEnvironmentTestImage:
+    title: Deployment Image
+    stage: org-environment
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-environment
+    no_cache: false
+    no_cf_cache: true
+    target: source
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-environment/Dockerfile
+    tag: ${{ORG_ENVIRONMENT_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ENVIRONMENT}}' == 'true'"
+  RunOrgEnvironmentUnitTests:
+    title: Run Unit Tests
+    stage: org-environment
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-environment
+    image: ${{BuildOrgEnvironmentTestImage}}
+    commands:
+    - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildOrgEnvironmentTestImage
+        on:
+        - success
+  BuildOrgEnvironmentDeployImage:
+    title: Deployment Image
+    stage: org-environment
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: org-environment
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-environment/Dockerfile
+    tag: ${{ORG_ENVIRONMENT_TAG}}
+    when:
+      steps:
+      - name: RunOrgEnvironmentUnitTests
+        on:
+        - success
+  PushOrgEnvironmentToDockerRegistryAmerica: &org_environment_registry_push
+    title: Push to Artifact Registry
+    stage: org-environment
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-environment
+    candidate: ${{BuildOrgEnvironmentDeployImage}}
+    tags:
+    - ${{ORG_ENVIRONMENT_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildOrgEnvironmentDeployImage
+        on:
+        - success
+  PushOrgEnvironmentToDockerRegistryEurope:
+    <<: *org_environment_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-environment
+    registry: fr-pre-prod-registry-emea
+  PushOrgEnvironmentToDockerRegistryAsia:
+    <<: *org_environment_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-environment
+    registry: fr-pre-prod-registry-asia
+  OrgEnvironmentStageCompleted:
+    title: Completed
+    stage: org-environment
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_ENVIRONMENT_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushOrgEnvironmentToDockerRegistryAmerica.result == 'success' ) && ( steps.PushOrgEnvironmentToDockerRegistryEurope.result == 'success' ) && ( steps.PushOrgEnvironmentToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_ENVIRONMENT}}' == 'false'"
+  #
+  # org-promo steps
+  #
+  BuildOrgPromoTestImage:
+    title: Test Image
+    stage: org-promo
+    type: build
+    buildkit: true
+    image_name: org-promo
+    no_cache: false
+    no_cf_cache: true
+    target: source
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-promo/Dockerfile
+    tag: ${{ORG_PROMO_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_PROMO}}' == 'true'"
+  TestOrgPromo:
+    type: parallel
+    stage: org-promo
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunOrgPromoUnitTests:
+        title: Run Unit Tests
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-promo
+        image: ${{BuildOrgPromoTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildOrgPromoTestImage
+        on:
+        - success
+  BuildOrgPromoDeployImage:
+    title: Deployment Image
+    stage: org-promo
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    buildkit: true
+    image_name: org-promo
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-promo/Dockerfile
+    tag: ${{ORG_PROMO_TAG}}
+    when:
+      steps:
+      - name: TestOrgPromo
+        on:
+        - success
+  PushOrgPromoToDockerRegistryAmerica: &org_promo_registry_push
+    title: Push to Artifact Registry
+    stage: org-promo
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-promo
+    candidate: ${{BuildOrgPromoDeployImage}}
+    tags:
+    - ${{ORG_PROMO_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildOrgPromoDeployImage
+        on:
+        - success
+  PushOrgPromoToDockerRegistryEurope:
+    <<: *org_promo_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-promo
+    registry: fr-pre-prod-registry-emea
+  PushOrgPromoToDockerRegistryAsia:
+    <<: *org_promo_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-promo
+    registry: fr-pre-prod-registry-asia
+  OrgPromoStageCompleted:
+    title: Completed
+    stage: org-promo
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_PROMO_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushOrgPromoToDockerRegistryAmerica.result == 'success' ) && ( steps.PushOrgPromoToDockerRegistryEurope.result == 'success' ) && ( steps.PushOrgPromoToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_PROMO}}' == 'false'"
+  #
+  # haproxy steps
+  #
+  TestHaproxyConfig:
+    title: Test haproxy config
+    stage: haproxy
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: haproxy
+    target: check
+    working_directory: /codefresh/volume/saas
+    dockerfile: services/forgecloud/customer/identity-paas/haproxy/Dockerfile
+    tag: ${{HAPROXY_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_HAPROXY}}' == 'true'"
+  BuildHaproxyDeployImage:
+    title: Deployment Image
+    stage: haproxy
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: haproxy
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    dockerfile: services/forgecloud/customer/identity-paas/haproxy/Dockerfile
+    tag: ${{HAPROXY_TAG}}
+    when:
+      steps:
+      - name: TestHaproxyConfig
+        on:
+        - success
+  PushHaproxyToDockerRegistryAmerica: &haproxy_registry_push
+    title: Push to Artifact Registry
+    stage: haproxy
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/haproxy
+    candidate: ${{BuildHaproxyDeployImage}}
+    tags:
+    - ${{HAPROXY_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildHaproxyDeployImage
+        on:
+        - success
+  PushHaproxyToDockerRegistryEurope:
+    <<: *haproxy_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/haproxy
+    registry: fr-pre-prod-registry-emea
+  PushHaproxyToDockerRegistryAsia:
+    <<: *haproxy_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/haproxy
+    registry: fr-pre-prod-registry-asia
+  HaproxyStageCompleted:
+    title: Completed
+    stage: haproxy
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{HAPROXY_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushHaproxyToDockerRegistryAmerica.result == 'success' ) && ( steps.PushHaproxyToDockerRegistryEurope.result == 'success' ) && ( steps.PushHaproxyToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_HAPROXY}}' == 'false'"
+  #
+  # prometheus steps
+  #
+  TestPrometheusConfig:
+    title: Test prometheus config
+    stage: prometheus
+    type: build
+    buildkit: true
+    no_cache: false
+    no_cf_cache: true
+    image_name: prometheus
+    target: configtest
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/prometheus/Dockerfile
+    tag: ${{PROMETHEUS_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS}}' == 'true'"
+  BuildPrometheusDeployImage:
+    title: Deployment Image
+    stage: prometheus
+    type: build
+    buildkit: true
+    image_name: prometheus
+    target: image
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/prometheus/Dockerfile
+    tag: ${{PROMETHEUS_TAG}}
+    when:
+      steps:
+      - name: TestPrometheusConfig
+        on:
+        - success
+  PushPrometheusToDockerRegistryAmerica: &prometheus_registry_push
+    title: Push to Artifact Registry
+    stage: prometheus
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/prometheus
+    candidate: ${{BuildPrometheusDeployImage}}
+    tags:
+    - ${{PROMETHEUS_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPrometheusDeployImage
+        on:
+        - success
+  PushPrometheusToDockerRegistryEurope:
+    <<: *prometheus_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/prometheus
+    registry: fr-pre-prod-registry-emea
+  PushPrometheusToDockerRegistryAsia:
+    <<: *prometheus_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/prometheus
+    registry: fr-pre-prod-registry-asia
+  PrometheusStageCompleted:
+    title: Completed
+    stage: prometheus
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PROMETHEUS_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPrometheusToDockerRegistryAmerica.result == 'success' ) && ( steps.PushPrometheusToDockerRegistryEurope.result == 'success' ) && ( steps.PushPrometheusToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_PROMETHEUS}}' == 'false'"
+  #
+  # thanos steps
+  #
+  BuildThanosImage:
+    title: Deployment Image
+    stage: thanos
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: thanos
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/thanos/Dockerfile
+    tag: ${{THANOS_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_THANOS}}' == 'true'"
+  PushThanosToDockerRegistryAmerica: &thanos_registry_push
+    title: Push to Artifact Registry
+    stage: thanos
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/thanos
+    candidate: ${{BuildThanosImage}}
+    tags:
+    - ${{THANOS_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildThanosImage
+        on:
+        - success
+  PushThanosToDockerRegistryEurope:
+    <<: *thanos_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/thanos
+    registry: fr-pre-prod-registry-emea
+  PushThanosToDockerRegistryAsia:
+    <<: *thanos_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/thanos
+    registry: fr-pre-prod-registry-asia
+  ThanosStageCompleted:
+    title: Completed
+    stage: thanos
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{THANOS_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushThanosToDockerRegistryAmerica.result == 'success' ) && ( steps.PushThanosToDockerRegistryEurope.result == 'success' ) && ( steps.PushThanosToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_THANOS}}' == 'false'"
+  #
+  # intezer steps
+  #
+  BuildIntezerDeployImage:
+    title: Deployment Image
+    stage: intezer
+    type: build
+    buildkit: true
+    image_name: intezer
+    target: image
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/intezer/Dockerfile
+    tag: ${{INTEZER_TAG}}
+    build_arguments:
+    - SENSOR_LICENSE_KEY=${{SENSOR_LICENSE_KEY}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_INTEZER}}' == 'true'"
+  PushIntezerToDockerRegistryAmerica: &intezer_registry_push
+    title: Push to Artifact Registry
+    stage: intezer
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/intezer
+    candidate: ${{BuildIntezerDeployImage}}
+    tags:
+    - ${{INTEZER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildIntezerDeployImage
+        on:
+        - success
+  PushIntezerToDockerRegistryEurope:
+    <<: *intezer_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/intezer
+    registry: fr-pre-prod-registry-emea
+  PushIntezerToDockerRegistryAsia:
+    <<: *intezer_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/intezer
+    registry: fr-pre-prod-registry-asia
+  IntezerStageCompleted:
+    title: Completed
+    stage: intezer
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{INTEZER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushIntezerToDockerRegistryAmerica.result == 'success' ) && ( steps.PushIntezerToDockerRegistryEurope.result == 'success' ) && ( steps.PushIntezerToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_INTEZER}}' == 'false'"
+  #
+  # gatekeeper steps
+  #
+  BuildGatekeeperImages:
+    title: Build Gatekeeper Images
+    type: parallel
+    stage: gatekeeper
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_GATEKEEPER}}' == 'true'"
+    steps:
+      BuildGatekeeperDeployImage:
+        title: Build Gatekeeper Image
+        stage: gatekeeper
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: gatekeeper
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas
+        dockerfile: 3rdparty/gatekeeper/Dockerfile
+        tag: ${{GATEKEEPER_TAG}}
+      BuildGatorDeployImage:
+        title: Build Gator Image
+        stage: gatekeeper
+        type: build
+        retry:
+          maxAttempts: 2
+        buildkit: true
+        image_name: gator
+        no_cache: false
+        no_cf_cache: true
+        working_directory: /codefresh/volume/saas
+        dockerfile: 3rdparty/gatekeeper/gator.Dockerfile
+        tag: ${{GATEKEEPER_TAG}}
+  PushGatekeeperImages:
+    title: Push Gatekeeper Images
+    type: parallel
+    stage: gatekeeper
+    when:
+      steps:
+      - name: BuildGatekeeperImages
+        on:
+        - success
+    steps:
+      PushGatekeeperToDockerRegistryAmerica: &gatekeeper_registry_push
+        title: Push Gatekeeper to Artifact Registry
+        stage: gatekeeper
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/gatekeeper
+        candidate: ${{BuildGatekeeperDeployImage}}
+        tags:
+        - ${{GATEKEEPER_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushGatekeeperToDockerRegistryEurope:
+        <<: *gatekeeper_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/gatekeeper
+        registry: fr-pre-prod-registry-emea
+      PushGatekeeperToDockerRegistryAsia:
+        <<: *gatekeeper_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/gatekeeper
+        registry: fr-pre-prod-registry-asia
+      PushGatorToDockerRegistryAmerica: &gator_registry_push
+        title: Push Gator to Artifact Registry
+        stage: gatekeeper
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/gator
+        candidate: ${{BuildGatorDeployImage}}
+        tags:
+        - ${{GATEKEEPER_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushGatorToDockerRegistryEurope:
+        <<: *gator_registry_push
+        image_name: fr-pre-prod-registry/container-images-emea/gator
+        registry: fr-pre-prod-registry-emea
+      PushGatorToDockerRegistryAsia:
+        <<: *gator_registry_push
+        image_name: fr-pre-prod-registry/container-images-apac/gator
+        registry: fr-pre-prod-registry-asia
+  GatekeeperStageCompleted:
+    title: Completed
+    stage: gatekeeper
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{GATEKEEPER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.BuildGatekeeperImages.result == 'success' ) && ( steps.PushGatekeeperImages.result == 'success' )
+          skipBuild: "'${{BUILD_GATEKEEPER}}' == 'false'"
+  #
+  # edgedelta steps
+  #
+  BuildEdgedeltaDeployImage:
+    title: Deployment Image
+    stage: edgedelta
+    type: build
+    buildkit: true
+    image_name: edgedelta
+    target: image
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/edgedelta/Dockerfile
+    tag: ${{EDGEDELTA_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_EDGEDELTA}}' == 'true'"
+  PushEdgedeltaToDockerRegistryAmerica: &edgedelta_registry_push
+    title: Push to Artifact Registry
+    stage: edgedelta
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/edgedelta
+    candidate: ${{BuildEdgedeltaDeployImage}}
+    tags:
+    - ${{EDGEDELTA_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildEdgedeltaDeployImage
+        on:
+        - success
+  PushEdgedeltaToDockerRegistryEurope:
+    <<: *edgedelta_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/edgedelta
+    registry: fr-pre-prod-registry-emea
+  PushEdgedeltaToDockerRegistryAsia:
+    <<: *edgedelta_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/edgedelta
+    registry: fr-pre-prod-registry-asia
+  EdgedeltaStageCompleted:
+    title: Completed
+    stage: edgedelta
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{EDGEDELTA_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushEdgedeltaToDockerRegistryAmerica.result == 'success' ) && ( steps.PushEdgedeltaToDockerRegistryEurope.result == 'success' ) && ( steps.PushEdgedeltaToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_EDGEDELTA}}' == 'false'"
+  #
+  # util image steps
+  #
+  BuildUtilDeployImage:
+    title: Deployment Image
+    stage: util
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: util
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    dockerfile: deploy/docker/util/Dockerfile
+    tag: ${{UTIL_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_UTIL}}' == 'true'"
+  PushUtilToDockerRegistryAmerica: &util_registry_push
+    title: Push to Artifact Registry
+    stage: util
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/util
+    candidate: ${{BuildUtilDeployImage}}
+    tags:
+    - ${{UTIL_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildUtilDeployImage
+        on:
+        - success
+  PushUtilToDockerRegistryEurope:
+    <<: *util_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/util
+    registry: fr-pre-prod-registry-emea
+  PushUtilToDockerRegistryAsia:
+    <<: *util_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/util
+    registry: fr-pre-prod-registry-asia
+  UtilStageCompleted:
+    title: Completed
+    stage: util
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{UTIL_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushUtilToDockerRegistryAmerica.result == 'success' ) && ( steps.PushUtilToDockerRegistryEurope.result == 'success' ) && ( steps.PushUtilToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_UTIL}}' == 'false'"
+  #
+  # workload-identity-init image steps
+  #
+  BuildWorkloadIdentityInitDeployImage:
+    title: Deployment Image
+    stage: workload-identity-init
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: workload-identity-init
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/deploy/docker/workload-identity-init/
+    dockerfile: Dockerfile
+    tag: ${{WORKLOAD_IDENTITY_INIT_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_WORKLOAD_IDENTITY_INIT}}' == 'true'"
+  PushWorkloadIdentityInitToDockerRegistryAmerica: &workload_identity_registry_push
+    title: Push to Artifact Registry
+    stage: workload-identity-init
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/workload-identity-init
+    candidate: ${{BuildWorkloadIdentityInitDeployImage}}
+    tags:
+    - ${{WORKLOAD_IDENTITY_INIT_TAG}}
+    - ${{FLOATING_IMAGE_TAG}}
+    - ${{STATIC_IMAGE_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildWorkloadIdentityInitDeployImage
+        on:
+        - success
+  PushWorkloadIdentityInitToDockerRegistryEurope:
+    <<: *workload_identity_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/workload-identity-init
+    registry: fr-pre-prod-registry-emea
+  PushWorkloadIdentityInitToDockerRegistryAsia:
+    <<: *workload_identity_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/workload-identity-init
+    registry: fr-pre-prod-registry-asia
+  WorkloadIdentityInitStageCompleted:
+    title: Completed
+    stage: workload-identity-init
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{WORKLOAD_IDENTITY_INIT_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushWorkloadIdentityInitToDockerRegistryAmerica.result == 'success' ) &&  ( steps.PushWorkloadIdentityInitToDockerRegistryEurope.result == 'success' ) && ( steps.PushWorkloadIdentityInitToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_WORKLOAD_IDENTITY_INIT}}' == 'false'"
+  #
+  # kube-state-metrics steps
+  #
+  BuildKubeStateMetricsImage:
+    title: Deployment Image
+    stage: kube-state-metrics
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: kube-state-metrics
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/kube-state-metrics/Dockerfile
+    tag: ${{KUBE_STATE_METRICS_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_KUBE_STATE_METRICS}}' == 'true'"
+  PushKubeStateMetricsToDockerRegistryAmerica: &kube_state_metrics_registry_push
+    title: Push to Artifact Registry
+    stage: kube-state-metrics
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/kube-state-metrics
+    candidate: ${{BuildKubeStateMetricsImage}}
+    tags:
+    - ${{KUBE_STATE_METRICS_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildKubeStateMetricsImage
+        on:
+        - success
+  PushKubeStateMetricsToDockerRegistryEurope:
+    <<: *kube_state_metrics_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/kube-state-metrics
+    registry: fr-pre-prod-registry-emea
+  PushKubeStateMetricsToDockerRegistryAsia:
+    <<: *kube_state_metrics_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/kube-state-metrics
+    registry: fr-pre-prod-registry-asia
+  KubeStateMetricsStageCompleted:
+    title: Completed
+    stage: kube-state-metrics
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{KUBE_STATE_METRICS_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushKubeStateMetricsToDockerRegistryAmerica.result == 'success' ) && ( steps.PushKubeStateMetricsToDockerRegistryEurope.result == 'success' ) && ( steps.PushKubeStateMetricsToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_KUBE_STATE_METRICS}}' == 'false'"
+  #
+  # prometheus-blackbox-exporter steps
+  #
+  BuildPrometheusBlackboxExporterImage:
+    title: Deployment Image
+    stage: prometheus-blackbox-exporter
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: prometheus-blackbox-exporter
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/prometheus-blackbox-exporter/Dockerfile
+    tag: ${{PROMETHEUS_BLACKBOX_EXPORTER_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_BLACKBOX_EXPORTER}}' == 'true'"
+  PushPrometheusBlackboxExporterToDockerRegAmerica: &prometheus_blackbox_exporter_registry_push
+    title: Push to Artifact Registry
+    stage: prometheus-blackbox-exporter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/prometheus-blackbox-exporter
+    candidate: ${{BuildPrometheusBlackboxExporterImage}}
+    tags:
+    - ${{PROMETHEUS_BLACKBOX_EXPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPrometheusBlackboxExporterImage
+        on:
+        - success
+  PushPrometheusBlackboxExporterToDockerRegEurope:
+    <<: *prometheus_blackbox_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/prometheus-blackbox-exporter
+    registry: fr-pre-prod-registry-emea
+  PushPrometheusBlackboxExporterToDockerRegAsia:
+    <<: *prometheus_blackbox_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/prometheus-blackbox-exporter
+    registry: fr-pre-prod-registry-asia
+  PrometheusBlackboxExporterStageCompleted:
+    title: Completed
+    stage: prometheus-blackbox-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PROMETHEUS_BLACKBOX_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPrometheusBlackboxExporterToDockerRegAmerica.result == 'success' ) && ( steps.PushPrometheusBlackboxExporterToDockerRegEurope.result == 'success' ) && ( steps.PushPrometheusBlackboxExporterToDockerRegAsia.result == 'success' )
+          skipBuild: "'${{BUILD_PROMETHEUS_BLACKBOX_EXPORTER}}' == 'false'"
+  #
+  # prometheus-json-exporter steps
+  #
+  BuildPrometheusJsonExporterImage:
+    title: Deployment Image
+    stage: prometheus-json-exporter
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: prometheus-json-exporter
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/prometheus-json-exporter/Dockerfile
+    tag: ${{PROMETHEUS_JSON_EXPORTER_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_JSON_EXPORTER}}' == 'true'"
+  PushPrometheusJsonExporterToDockerRegistryAmerica: &prometheus_json_exporter_registry_push
+    title: Push to Artifact Registry
+    stage: prometheus-json-exporter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/prometheus-json-exporter
+    candidate: ${{BuildPrometheusJsonExporterImage}}
+    tags:
+    - ${{PROMETHEUS_JSON_EXPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPrometheusJsonExporterImage
+        on:
+        - success
+  PushPrometheusJsonExporterToDockerRegistryEurope:
+    <<: *prometheus_json_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/prometheus-json-exporter
+    registry: fr-pre-prod-registry-emea
+  PushPrometheusJsonExporterToDockerRegistryAsia:
+    <<: *prometheus_json_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/prometheus-json-exporter
+    registry: fr-pre-prod-registry-asia
+  PrometheusJsonExporterStageCompleted:
+    title: Completed
+    stage: prometheus-json-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PROMETHEUS_JSON_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: (steps.PushPrometheusJsonExporterToDockerRegistryAmerica.result == 'success') && (steps.PushPrometheusJsonExporterToDockerRegistryEurope.result == 'success') && (steps.PushPrometheusJsonExporterToDockerRegistryAsia.result == 'success')
+          skipBuild: "'${{BUILD_PROMETHEUS_JSON_EXPORTER}}' == 'false'"
+  #
+  # prometheus-node-exporter steps
+  #
+  BuildPrometheusNodeExporterImage:
+    title: Deployment Image
+    stage: prometheus-node-exporter
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: prometheus-node-exporter
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/prometheus-node-exporter/Dockerfile
+    tag: ${{PROMETHEUS_NODE_EXPORTER_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_NODE_EXPORTER}}' == 'true'"
+  PushPrometheusNodeExporterToDockerRegistryAmerica: &prometheus_node_exporter_registry_push
+    title: Push to Artifact Registry
+    stage: prometheus-node-exporter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/prometheus-node-exporter
+    candidate: ${{BuildPrometheusNodeExporterImage}}
+    tags:
+    - ${{PROMETHEUS_NODE_EXPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPrometheusNodeExporterImage
+        on:
+        - success
+  PushPrometheusNodeExporterToDockerRegistryEurope:
+    <<: *prometheus_node_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/prometheus-node-exporter
+    registry: fr-pre-prod-registry-emea
+  PushPrometheusNodeExporterToDockerRegistryAsia:
+    <<: *prometheus_node_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/prometheus-node-exporter
+    registry: fr-pre-prod-registry-asia
+  PrometheusNodeExporterStageCompleted:
+    title: Completed
+    stage: prometheus-node-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PROMETHEUS_NODE_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPrometheusNodeExporterToDockerRegistryAmerica.result == 'success' ) && ( steps.PushPrometheusNodeExporterToDockerRegistryEurope.result == 'success' ) && ( steps.PushPrometheusNodeExporterToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_PROMETHEUS_NODE_EXPORTER}}' == 'false'"
+  #
+  # prometheus-stackdriver-exporter steps
+  #
+  BuildPrometheusStackdriverExporterImage:
+    title: Deployment Image
+    stage: prometheus-stackdriver-exporter
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: prometheus-stackdriver-exporter
+    working_directory: /codefresh/volume/saas
+    dockerfile: 3rdparty/prometheus-stackdriver-exporter/Dockerfile
+    tag: ${{PROMETHEUS_STACKDRIVER_EXPORTER_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_STACKDRIVER_EXPORTER}}' == 'true'"
+  PushPrometheusStackdriverExporterToDockerRegAmerica: &prometheus_stackdriver_exporter_registry_push
+    title: Push to Artifact Registry to America
+    stage: prometheus-stackdriver-exporter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/prometheus-stackdriver-exporter
+    candidate: ${{BuildPrometheusStackdriverExporterImage}}
+    tags:
+    - ${{PROMETHEUS_STACKDRIVER_EXPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPrometheusStackdriverExporterImage
+        on:
+        - success
+  PushPrometheusStackdriverExporterToDockerRegEurope:
+    <<: *prometheus_stackdriver_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/prometheus-stackdriver-exporter
+    registry: fr-pre-prod-registry-emea
+  PushPrometheusStackdriverExporterToDockerRegAsia:
+    <<: *prometheus_stackdriver_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/prometheus-stackdriver-exporter
+    registry: fr-pre-prod-registry-asia
+  PrometheusStackdriverExporterStageCompleted:
+    title: Completed
+    stage: prometheus-stackdriver-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PROMETHEUS_STACKDRIVER_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPrometheusStackdriverExporterToDockerRegAmerica.result == 'success' ) && ( steps.PushPrometheusStackdriverExporterToDockerRegEurope.result == 'success' ) && ( steps.PushPrometheusStackdriverExporterToDockerRegAsia.result == 'success' )
+          skipBuild: "'${{BUILD_PROMETHEUS_STACKDRIVER_EXPORTER}}' == 'false'"
+  #
+  # platform-ui
+  #
+  BuildPlatformUiDeployImage:
+    title: Deployment image
+    stage: platform-ui
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: platform-ui
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/services/forgecloud/customer/identity-paas/platform-ui
+    dockerfile: Dockerfile
+    tag: ${{PLATFORM_UI_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PLATFORM_UI}}' == 'true'"
+  PushPlatformUiToDockerRegistries:
+    title: Push to Artifact Registries
+    stage: platform-ui
+    type: parallel
+    nocache: false
+    no_cf_cache: true
+    steps:
+      PushPlatformUiToDockerRegistryAmerica: &platform_ui_registry_push
+        title: Push to Artifact Registry in America
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/platform-ui
+        candidate: ${{BuildPlatformUiDeployImage}}
+        tags:
+        - ${{PLATFORM_UI_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushPlatformUiToDockerRegistryEurope:
+        <<: *platform_ui_registry_push
+        title: Push to Artifact Registry in Europe
+        image_name: fr-pre-prod-registry/container-images-emea/platform-ui
+        registry: fr-pre-prod-registry-emea
+      PushPlatformUiToDockerRegistryAsia:
+        <<: *platform_ui_registry_push
+        title: Push to Artifact Registry in Asia
+        image_name: fr-pre-prod-registry/container-images-apac/platform-ui
+        registry: fr-pre-prod-registry-asia
+    when:
+      steps:
+      - name: BuildPlatformUiDeployImage
+        on:
+        - success
+  PlatformUiStageCompleted:
+    title: Completed
+    stage: platform-ui
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PLATFORM_UI_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPlatformUiToDockerRegistries.result == 'success' )
+          skipBuild: "'${{BUILD_PLATFORM_UI}}' == 'false'"
+  #
+  # build auto-environment pipeline
+  #
+  BuildAutoEnvironment:
+    title: Build Autonomous Environment Pipeline
+    stage: auto-environment
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-environment
+      TRIGGER_ID: auto-environment-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_ENVIRONMENT}}' == 'true'"
+  AutoEnvironmentCompleted:
+    title: Completed
+    stage: auto-environment
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "AUTO_ANALYTICS_API_TAG=${{AUTO_ANALYTICS_API_TAG}}"
+    - echo "AUTO_ANALYTICS_ETL_JOB_TAG=${{AUTO_ANALYTICS_ETL_JOB_TAG}}"
+    - echo "AUTO_ANALYTICS_TEMPLATE_DATAFLOW_TAG=${{AUTO_ANALYTICS_TEMPLATE_DATAFLOW_TAG}}"
+    - echo "ZORAN_API_TAG=${{ZORAN_API_TAG}}"
+    - echo "JAS_TAG=${{JAS_TAG}}"
+    - echo "AUTO_ACCESS_API_TAG=${{AUTO_ACCESS_API_TAG}}"
+    - echo "ACCESS_EXPLAINABILITY_TAG=${{ACCESS_EXPLAINABILITY_TAG}}"
+    - echo "TENANCY_INITIALIZER_TAG=${{TENANCY_INITIALIZER_TAG}}"
+    - echo "ACCESS_FLEX_JAVA_TEMPLATE_TAG=${{ACCESS_FLEX_JAVA_TEMPLATE_TAG}}"
+    - echo "ACCESS_FLEX_PYTHON_TEMPLATE_TAG=${{ACCESS_FLEX_PYTHON_TEMPLATE_TAG}}"
+    - echo "ETL_RUNNER_TAG=${{ETL_RUNNER_TAG}}"
+    - echo "ETL_DATAFLOW_TEMPLATE_TAG=${{ETL_DATAFLOW_TEMPLATE_TAG}}"
+    - echo "AUTO_ACCESS_DEMO_DATA_SEEDER_TAG=${{AUTO_ACCESS_DEMO_DATA_SEEDER_TAG}}"
+    - echo "AI_PLATFORM_EXPORTER_TAG=${{AI_PLATFORM_EXPORTER_TAG}}"
+    - echo "AUTO_TERRAFORM_TAG=${{AUTO_TERRAFORM_TAG}}"
+    - echo "IGA_API_TAG=${{IGA_API_TAG}}"
+    - echo "IGA_INIT_TAG=${{IGA_INIT_TAG}}"
+    - echo "AUTO_STARTER_TAG=${{AUTO_STARTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: steps.BuildAutoEnvironment.result == 'success'
+          skipBuild: "'${{BUILD_AUTO_ENVIRONMENT}}' == 'false'"
+  #
+  # push gateway
+  #
+  BuildPushGatewayDeployImage:
+    title: Deployment image
+    stage: push-gateway
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: push-gateway
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: 3rdparty/prometheus-push-gateway/Dockerfile
+    tag: ${{PUSH_GATEWAY_TAG}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PUSH_GATEWAY}}' == 'true'"
+  PushPushGatewayToDockerRegistryAmerica: &push_gatekey_registry_push
+    title: Push to Artifact Registry
+    stage: push-gateway
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/push-gateway
+    candidate: ${{BuildPushGatewayDeployImage}}
+    tags:
+    - ${{PUSH_GATEWAY_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildPushGatewayDeployImage
+        on:
+        - success
+  PushPushGatewayToDockerRegistryEurope:
+    <<: *push_gatekey_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/push-gateway
+    registry: fr-pre-prod-registry-emea
+  PushPushGatewayToDockerRegistryAsia:
+    <<: *push_gatekey_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/push-gateway
+    registry: fr-pre-prod-registry-asia
+  PushGatewayStageCompleted:
+    title: Completed
+    stage: push-gateway
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{PUSH_GATEWAY_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushPushGatewayToDockerRegistryAmerica.result == 'success' ) && ( steps.PushPushGatewayToDockerRegistryEurope.result == 'success' ) && ( steps.PushPushGatewayToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_PUSH_GATEWAY}}' == 'false'"
+  #
+  # mon-metadata-exporter steps
+  #
+  BuildMonMetadataExporterUnitTestImage:
+    title: Test image
+    stage: mon-metadata-exporter
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: mon-metadata-exporter-build
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/mon-metadata-exporter/Dockerfile
+    tag: ${{MON_METADATA_EXPORTER_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_MON_METADATA_EXPORTER}}' == 'true'"
+  TestMonMetadataExporter:
+    type: parallel
+    stage: mon-metadata-exporter
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      # Currently no Unit tests to run however leaving in place for completeness
+      RunMonMetadataExporterUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/mon-metadata-exporter
+        image: ${{BuildMonMetadataExporterUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildMonMetadataExporterUnitTestImage
+        on:
+        - success
+  BuildMonMetadataExporterDeployImage:
+    title: Deployment image
+    stage: mon-metadata-exporter
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: mon-metadata-exporter
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/mon-metadata-exporter/Dockerfile
+    tag: ${{MON_METADATA_EXPORTER_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestMonMetadataExporter
+        on:
+        - success
+  PushMonMetadataExporterToDockerRegistryAmerica: &mon_metadata_exporter_registry_push
+    title: Push to Artifact Registry
+    stage: mon-metadata-exporter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/mon-metadata-exporter
+    candidate: ${{BuildMonMetadataExporterDeployImage}}
+    tags:
+    - ${{MON_METADATA_EXPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildMonMetadataExporterDeployImage
+        on:
+        - success
+  PushMonMetadataExporterToDockerRegistryEurope:
+    <<: *mon_metadata_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/mon-metadata-exporter
+    registry: fr-pre-prod-registry-emea
+  PushMonMetadataExporterToDockerRegistryAsia:
+    <<: *mon_metadata_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/mon-metadata-exporter
+    registry: fr-pre-prod-registry-asia
+  MonMetadataExporterStageCompleted:
+    title: Completed
+    stage: mon-metadata-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{MON_METADATA_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushMonMetadataExporterToDockerRegistryAmerica.result == 'success' ) && ( steps.PushMonMetadataExporterToDockerRegistryEurope.result == 'success' ) && ( steps.PushMonMetadataExporterToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_MON_METADATA_EXPORTER}}' == 'false'"
+  #
+  # mon-pingdom-exporter steps
+  #
+  BuildMonPingdomExporterUnitTestImage:
+    title: Test image
+    stage: mon-pingdom-exporter
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: mon-pingdom-exporter-build
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/mon-pingdom-exporter/Dockerfile
+    tag: ${{MON_PINGDOM_EXPORTER_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_MON_PINGDOM_EXPORTER}}' == 'true'"
+  TestMonPingdomExporter:
+    type: parallel
+    stage: mon-pingdom-exporter
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      # Currently no Unit tests to run however leaving in place for completeness
+      RunMonPingdomExporterUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/mon-pingdom-exporter
+        image: ${{BuildMonPingdomExporterUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildMonPingdomExporterUnitTestImage
+        on:
+        - success
+  BuildMonPingdomExporterDeployImage:
+    title: Deployment image
+    stage: mon-pingdom-exporter
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: mon-pingdom-exporter
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/mon-pingdom-exporter/Dockerfile
+    tag: ${{MON_PINGDOM_EXPORTER_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestMonPingdomExporter
+        on:
+        - success
+  PushMonPingdomExporterToDockerRegistryAmerica: &mon_pingdom_exporter_registry_push
+    title: Push to Artifact Registry
+    stage: mon-pingdom-exporter
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/mon-pingdom-exporter
+    candidate: ${{BuildMonPingdomExporterDeployImage}}
+    tags:
+    - ${{MON_PINGDOM_EXPORTER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildMonPingdomExporterDeployImage
+        on:
+        - success
+  PushMonPingdomExporterToDockerRegistryEurope:
+    <<: *mon_pingdom_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/mon-pingdom-exporter
+    registry: fr-pre-prod-registry-emea
+  PushMonPingdomExporterToDockerRegistryAsia:
+    <<: *mon_pingdom_exporter_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/mon-pingdom-exporter
+    registry: fr-pre-prod-registry-asia
+  MonPingdomExporterStageCompleted:
+    title: Completed
+    stage: mon-pingdom-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{MON_PINGDOM_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushMonPingdomExporterToDockerRegistryAmerica.result == 'success' ) && ( steps.PushMonPingdomExporterToDockerRegistryEurope.result == 'success' ) && ( steps.PushMonPingdomExporterToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_MON_PINGDOM_EXPORTER}}' == 'false'"
+  #
+  # mon-identities-exporter steps
+  #
+  BuildMonIdentitiesExporterUnitTestImage:
+    title: Test image
+    stage: mon-identities-exporter
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: mon-identities-exporter-build
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/mon-identities-exporter/Dockerfile
+    tag: ${{MON_IDENTITIES_EXPORTER_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_MON_IDENTITIES_EXPORTER}}' == 'true'"
+  TestMonIdentitiesExporter:
+    type: parallel
+    stage: mon-identities-exporter
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      # Currently no Unit tests to run however leaving in place for completeness
+      RunMonIdentitiesExporterUnitTests:
+        title: Run Unit Tests
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/mon-identities-exporter
+        image: ${{BuildMonIdentitiesExporterUnitTestImage}}
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildMonIdentitiesExporterUnitTestImage
+        on:
+        - success
+  BuildMonIdentitiesExporterDeployImage:
+    title: Deployment image
+    stage: mon-identities-exporter
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: mon-identities-exporter
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/mon-identities-exporter/Dockerfile
+    tag: ${{MON_IDENTITIES_EXPORTER_TAG}}
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestMonIdentitiesExporter
+        on:
+        - success
+  PushMonIdentitiesExporterToDockerRegistries:
+    title: Push to Artifact Registries
+    stage: mon-identities-exporter
+    type: parallel
+    nocache: false
+    no_cf_cache: true
+    steps:
+      PushMonIdentitiesExporterToDockerRegistryAmerica: &mon_identities_exporter_registry_push
+        title: Push to Artifact Registry in America
+        stage: mon-identities-exporter
+        type: push
+        retry:
+          maxAttempts: 2
+        image_name: fr-pre-prod-registry/container-images/mon-identities-exporter
+        candidate: ${{BuildMonIdentitiesExporterDeployImage}}
+        tags:
+        - ${{MON_IDENTITIES_EXPORTER_TAG}}
+        registry: fr-pre-prod-registry-artifact-registry-write
+      PushMonIdentitiesExporterToDockerRegistryEurope:
+        <<: *mon_identities_exporter_registry_push
+        title: Push to Artifact Registry in Europe
+        image_name: fr-pre-prod-registry/container-images-emea/mon-identities-exporter
+        registry: fr-pre-prod-registry-emea
+      PushMonIdentitiesExporterToDockerRegistryAsia:
+        <<: *mon_identities_exporter_registry_push
+        title: Push to Artifact Registry in Asia
+        image_name: fr-pre-prod-registry/container-images-apac/mon-identities-exporter
+        registry: fr-pre-prod-registry-asia
+    when:
+      steps:
+      - name: BuildMonIdentitiesExporterDeployImage
+        on:
+        - success
+  MonIdentitiesExporterStageCompleted:
+    title: Completed
+    stage: mon-identities-exporter
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.17.3@sha256:185b360ebe11d2f4074b54831bf0c3cf5be221c36d02c816a37c5977acdadd83
+    commands:
+    - echo "Docker tag=${{MON_IDENTITIES_EXPORTER_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: steps.PushMonIdentitiesExporterToDockerRegistries.result == 'success'
+          skipBuild: "'${{BUILD_MON_IDENTITIES_EXPORTER}}' == 'false'"
+  #
+  # org-engine-binary steps
+  #
+  BuildEngineBinaryTestImage:
+    title: Build Testing Image
+    stage: org-engine-binary
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    no_cache: false
+    no_cf_cache: true
+    image_name: org-engine-test
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-engine/binary.Dockerfile
+    tag: ${{FLOATING_IMAGE_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ENGINE_BINARY}}' == 'true'"
+  TestEngine:
+    type: parallel
+    stage: org-engine-binary
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunEngineBinaryUnitTests:
+        title: Run Unit Tests
+        image: ${{BuildEngineBinaryTestImage}}
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-engine
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildEngineBinaryTestImage
+        on:
+        - success
+  BuildEngineBinaryImage:
+    title: Build Binary Image
+    stage: org-engine-binary
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: fr-pre-prod-registry/container-images/org-engine-binary-only
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-engine/binary.Dockerfile
+    tag: ${{ORG_ENGINE_BINARY_TAG}}
+    build_arguments:
+    - GOMODCACHE=${{GOMODCACHE}}
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestEngine
+        on:
+        - success
+  PushEngineBinaryToDockerRegistryAmerica: &org_engine_binary_registry_push
+    title: Push to Artifact Registry
+    stage: org-engine-binary
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-engine-binary
+    candidate: ${{BuildEngineBinaryImage}}
+    tags:
+    - ${{ORG_ENGINE_BINARY_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildEngineBinaryImage
+        on:
+        - success
+  PushEngineBinaryToDockerRegistryEurope:
+    <<: *org_engine_binary_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-engine-binary
+    registry: fr-pre-prod-registry-emea
+  PushEngineBinaryToDockerRegistryAsia:
+    <<: *org_engine_binary_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-engine-binary
+    registry: fr-pre-prod-registry-asia
+  EngineBinaryStageCompleted:
+    title: Completed
+    stage: org-engine-binary
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    commands:
+    - echo "Docker tag=${{ORG_ENGINE_BINARY_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushEngineBinaryToDockerRegistryAmerica.result == 'success' ) && ( steps.PushEngineBinaryToDockerRegistryEurope.result == 'success' ) && ( steps.PushEngineBinaryToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_ENGINE_BINARY}}' == 'false'"
+  #
+  # org-engine steps
+  #
+  BuildLocalBinaries:
+    type: parallel
+    title: Build CI image and binaries
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
+    steps:
+      KustomizeConfigDockerBuild:
+        type: build
+        image_name: kustomize_config_check
+        title: build image to check configs
+        buildkit: true
+        working_directory: /codefresh/volume/saas/
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+        dockerfile: deploy/docker/engine-config-test/Dockerfile
+      PackageLocal:
+        title: Package Local Binary
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/go-build-base:1.21.1-alpine3.18@sha256:8ff84364ddccc2ad81e728c523666468f175ff34e03377db8fd4c5a30e65a027
+        working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+        commands:
+        - go build -o /codefresh/volume/package_local /codefresh/volume/saas/go/services/customer/org-engine/cmd/package_local/*.go
+      EngineChecker:
+        title: Engine Checker Binary
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/go-build-base:1.21.1-alpine3.18@sha256:8ff84364ddccc2ad81e728c523666468f175ff34e03377db8fd4c5a30e65a027
+        working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+        commands:
+        - go build -o /codefresh/volume/engine-checker /codefresh/volume/saas/go/utilities/engine-checker/
+  PackageConfigs:
+    title: Packaging configs
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: ${{KustomizeConfigDockerBuild}}
+    working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+    commands:
+    - gcloud config set component_manager/disable_update_check true
+    - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+    - gcloud auth activate-service-account codefresh-read-account@fr-pre-prod-registry.iam.gserviceaccount.com --key-file=/tmp/registry-read-key.json
+    - gcloud auth configure-docker us-docker.pkg.dev --quiet
+    - rm -rf ./packaged-config
+    - /codefresh/volume/package_local package_config --saas_dir=/codefresh/volume/saas --package_into=/codefresh/volume/saas/go/services/customer/org-engine/packaged-config
+    when:
+      steps:
+      - name: GenerateBuildPlan
+        on:
+        - success
+      - name: BuildLocalBinaries
+        on:
+        - success
+  CheckKustomizeConfigs:
+    type: parallel
+    title: Check configs
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    steps:
+      CheckPackagedConfigs:
+        title: check packaged configs
+        image: ${{KustomizeConfigDockerBuild}}
+        working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+        no_cache: false
+        no_cf_cache: true
+        commands:
+        - gcloud config set component_manager/disable_update_check true
+        - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+        - gcloud auth activate-service-account codefresh-read-account@fr-pre-prod-registry.iam.gserviceaccount.com --key-file=/tmp/registry-read-key.json
+        - gcloud auth configure-docker us-docker.pkg.dev --quiet
+        - /codefresh/volume/engine-checker check-folder /codefresh/volume/saas/go/services/customer/org-engine/packaged-config
+      CheckKustomize:
+        title: Check Kustomize
+        image: ${{KustomizeConfigDockerBuild}}
+        working_directory: /codefresh/volume/saas/deploy/kustomize
+        no_cache: false
+        no_cf_cache: true
+        commands:
+        - mkdir -p /codefresh/volume/saas/go/services/customer/org-engine/image-lists
+        - gcloud config set component_manager/disable_update_check true
+        - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+        - gcloud auth activate-service-account codefresh-read-account@fr-pre-prod-registry.iam.gserviceaccount.com --key-file=/tmp/registry-read-key.json
+        - gcloud auth configure-docker us-docker.pkg.dev --quiet
+        - bash -c "ls -d base/*/kustomization.{yaml,tmpl.yaml} overlays/*/kustomization.{yaml,tmpl.yaml} gatekeeper/kustomization.yaml | sed -r 's/.kustomization.(yaml|tmpl.yaml)$//g' > /tmp/kust_dirs.txt"
+        - while read -r DIR; do echo "kustomizing ${DIR}"; /codefresh/volume/package_local kustomization --saas_dir=/codefresh/volume/saas --kustomize_config=$DIR 2>> /tmp/manifest.images; done < /tmp/kust_dirs.txt
+        - /codefresh/volume/engine-checker check-kustomization /tmp/manifest.images /codefresh/volume/saas/go/services/customer/org-engine/image-lists/manifest.list
+      CheckEngineersKey:
+        title: Check the engineer-keyring is valid
+        image: ${{KustomizeConfigDockerBuild}}
+        working_directory: /codefresh/volume/saas/deploy/kustomize/base/engineers-keyring
+        no_cache: false
+        no_cf_cache: true
+        commands:
+        - apk add --update gpg
+        - bash -c ./validate-keyring.sh
+    when:
+      steps:
+      - name: PackageConfigs
+        on:
+        - success
+      - name: OrgBootstrapperStageCompleted
+        on:
+        - success
+      - name: AmIdentityPaasStageCompleted
+        on:
+        - success
+      - name: AMConfigUpgraderStageCompleted
+        on:
+        - success
+      - name: AMKeystoreCopyStageCompleted
+        on:
+        - success
+      - name: BackupPlatformStageCompleted
+        on:
+        - success
+      - name: CommonStageCompleted
+        on:
+        - success
+      - name: ConfigLoaderStageCompleted
+        on:
+        - success
+      - name: CtsStoreStageCompleted
+        on:
+        - success
+      - name: EngineBinaryStageCompleted
+        on:
+        - success
+      - name: HaproxyStageCompleted
+        on:
+        - success
+      - name: IdmIdentityPaasStageCompleted
+        on:
+        - success
+      - name: LdifImporterStageCompleted
+        on:
+        - success
+      - name: OrgPromoStageCompleted
+        on:
+        - success
+      - name: MonMetadataExporterStageCompleted
+        on:
+        - success
+      - name: MonPingdomExporterStageCompleted
+        on:
+        - success
+      - name: MonIdentitiesExporterStageCompleted
+        on:
+        - success
+      - name: IntezerStageCompleted
+        on:
+        - success
+      - name: PrometheusStageCompleted
+        on:
+        - success
+      - name: PrometheusBlackboxExporterStageCompleted
+        on:
+        - success
+      - name: PrometheusJsonExporterStageCompleted
+        on:
+        - success
+      - name: PrometheusNodeExporterStageCompleted
+        on:
+        - success
+      - name: ThanosStageCompleted
+        on:
+        - success
+      - name: OrgFilterStageCompleted
+        on:
+        - success
+      - name: OrgLogSpewerStageCompleted
+        on:
+        - success
+      - name: OrgOrchAgentStageCompleted
+        on:
+        - success
+      - name: PlatformUiStageCompleted
+        on:
+        - success
+      - name: AutoEnvironmentCompleted
+        on:
+        - success
+      - name: SaverStageCompleted
+        on:
+        - success
+      - name: PushGatewayStageCompleted
+        on:
+        - success
+      - name: UserStoreIdentityPaasStageCompleted
+        on:
+        - success
+      - name: UtilStageCompleted
+        on:
+        - success
+      - name: WorkloadIdentityInitStageCompleted
+        on:
+        - success
+      - name: OrgEsvStageCompleted
+        on:
+        - success
+      - name: OrgEnvironmentStageCompleted
+        on:
+        - success
+      - name: UnlockLiquibaseStageCompleted
+        on:
+        - success
+      - name: KubeStateMetricsStageCompleted
+        on:
+        - success
+      - name: PrometheusStackdriverExporterStageCompleted
+        on:
+        - success
+  GetGitToken:
+    title: Reading Github token
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/codefresh/cli@sha256:edf3baa42bf28c4bf5bada5f8570669897d20355ba644670364fbd621101724c # codefresh/cli
+    commands:
+    - cf_export GITHUB_AUTH_TOKEN=$(codefresh get context github-app --decrypt -o yaml | yq -r .spec.data.auth.password)
+  GenerateBuildNumberTag:
+    title: Generate build number tag
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/gcloud-tools:1.5.0-alpine3.17-b012eec@sha256:7d831c2f486dcb554de8e79fe6864f54c352eaa6e8577f504f4db67aa0afd208
+    working_directory: /codefresh/volume/saas
+    fail_fast: false
+    environment:
+    - BRANCH=${{FLOATING_IMAGE_TAG}}
+    commands:
+    - deploy/bin/generate-build-number-tag.sh org-engine $BRANCH $CF_REVISION
+    when:
+      steps:
+      - name: CheckKustomizeConfigs
+        on:
+        - success
+  # This step will fail if the branch needs tag ordering and the floating tag has already been applied to a
+  # subsequent commit.
+  BuildEngineImage:
+    title: Build Deployment Image
+    stage: org-engine
+    type: build
+    retry:
+      maxAttempts: 2
+    no_cache: false
+    no_cf_cache: true
+    image_name: fr-pre-prod-registry/container-images/org-engine
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-engine/deploy.Dockerfile
+    tag: ${{FLOATING_IMAGE_TAG}}
+    build_arguments:
+    - BINARY_TAG=${{ORG_ENGINE_BINARY_TAG}}
+    - DOCKER_IMAGE_TAG="${{STATIC_IMAGE_TAG}}"
+    - KUBECTL_VERSION=${{KUBECTL_VERSION}}
+    - ARTIFACTORY_API_KEY=${{ARTIFACTORY_API_KEY}}
+    - RELEASE_VERSION=${{BUILD_NUMBER}}
+    when:
+      steps:
+      - name: CheckKustomizeConfigs
+        on:
+        - success
+      - name: AmIdentityPaasStageCompleted
+        on:
+        - success
+      - name: AMConfigUpgraderStageCompleted
+        on:
+        - success
+      - name: AMKeystoreCopyStageCompleted
+        on:
+        - success
+      - name: BackupPlatformStageCompleted
+        on:
+        - success
+      - name: CommonStageCompleted
+        on:
+        - success
+      - name: ConfigLoaderStageCompleted
+        on:
+        - success
+      - name: CtsStoreStageCompleted
+        on:
+        - success
+      - name: CertManagerStageCompleted
+        on:
+        - success
+      - name: EdgedeltaStageCompleted
+        on:
+        - success
+      - name: EngineBinaryStageCompleted
+        on:
+        - success
+      - name: GatekeeperStageCompleted
+        on:
+        - success
+      - name: GenerateBuildNumberTag
+        on:
+        - success
+      - name: HaproxyStageCompleted
+        on:
+        - success
+      - name: IntezerStageCompleted
+        on:
+        - success
+      - name: PrometheusStageCompleted
+        on:
+        - success
+      - name: PrometheusBlackboxExporterStageCompleted
+        on:
+        - success
+      - name: PrometheusNodeExporterStageCompleted
+        on:
+        - success
+      - name: PrometheusStackdriverExporterStageCompleted
+        on:
+        - success
+      - name: KubeStateMetricsStageCompleted
+        on:
+        - success
+      - name: ThanosStageCompleted
+        on:
+        - success
+      - name: IdmIdentityPaasStageCompleted
+        on:
+        - success
+      - name: OrgPromoStageCompleted
+        on:
+        - success
+      - name: LdifImporterStageCompleted
+        on:
+        - success
+      - name: MonMetadataExporterStageCompleted
+        on:
+        - success
+      - name: MonPingdomExporterStageCompleted
+        on:
+        - success
+      - name: MonIdentitiesExporterStageCompleted
+        on:
+        - success
+      - name: OrgFilterStageCompleted
+        on:
+        - success
+      - name: OrgLogSpewerStageCompleted
+        on:
+        - success
+      - name: OrgOrchAgentStageCompleted
+        on:
+        - success
+      - name: PlatformUiStageCompleted
+        on:
+        - success
+      - name: AutoEnvironmentCompleted
+        on:
+        - success
+      - name: SaverStageCompleted
+        on:
+        - success
+      - name: PushGatewayStageCompleted
+        on:
+        - success
+      - name: UserStoreIdentityPaasStageCompleted
+        on:
+        - success
+      - name: UtilStageCompleted
+        on:
+        - success
+      - name: WorkloadIdentityInitStageCompleted
+        on:
+        - success
+      - name: OrgEsvStageCompleted
+        on:
+        - success
+      - name: OrgEnvironmentStageCompleted
+        on:
+        - success
+      - name: UnlockLiquibaseStageCompleted
+        on:
+        - success
+  ShouldAddFloatingTag:
+    title: Should add floating tag
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/google/cloud-sdk@sha256:f88075440462c1e041ed8cda027a4b61cf992f9aef612425821d399962245131 # google/cloud-sdk:alpine
+    working_directory: /codefresh/volume/saas
+    fail_fast: false
+    commands:
+    # always add floating tag for non-master branches
+    - if [ "$BRANCH" != master ]; then exit 0; fi
+    # only add floating tag if this is the latest commit
+    - deploy/bin/check-head-after-floating-tag.sh org-engine $BRANCH
+    environment:
+    - BRANCH=${{FLOATING_IMAGE_TAG}}
+    - PRE_PROD_REGISTRY_READ_KEY_JSON=${{PRE_PROD_REGISTRY_READ_KEY_JSON}}
+    when:
+      steps:
+      - name: CheckKustomizeConfigs
+        on:
+        - success
+      - name: BuildEngineImage
+        on:
+        - success
+  # Push the org-engine container with both static and floating tags - do this only
+  #   if the floating tag is currently on an earlier commit, or if not on master.
+  PushEngineToDockerRegistryAmericaWithFloatingTag: &org_engine_tag_registry_push
+    title: Push floating tag to Artifact Registry
+    type: push
+    stage: org-engine
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-engine
+    candidate: ${{BuildEngineImage}}
+    tags:
+    - ${{FLOATING_IMAGE_TAG}}
+    - ${{STATIC_IMAGE_TAG}}
+    - ${{BUILD_NUMBER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: ShouldAddFloatingTag
+        on:
+        - success
+      - name: BuildEngineImage
+        on:
+        - success
+  PushEngineToDockerRegistryEuropeWithFloatingTag:
+    <<: *org_engine_tag_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-engine
+    registry: fr-pre-prod-registry-emea
+  PushEngineToDockerRegistryAsiaWithFloatingTag:
+    <<: *org_engine_tag_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-engine
+    registry: fr-pre-prod-registry-asia
+  # Push the org-engine container with only a static tag. Do this if on master
+  #   and the floating tag is on a subsequent commit.
+  PushEngineToDockerRegistryAmericaWithoutFloatingTag: &org_engine_registry_push
+    title: Push static tag to Artifact Registry
+    stage: org-engine
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-engine
+    candidate: ${{BuildEngineImage}}
+    tags:
+    - ${{STATIC_IMAGE_TAG}}
+    - ${{BUILD_NUMBER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: ShouldAddFloatingTag
+        on:
+        - failure
+      - name: BuildEngineImage
+        on:
+        - success
+  PushEngineToDockerRegistryEuropeWithoutFloatingTag:
+    <<: *org_engine_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-engine
+    registry: fr-pre-prod-registry-emea
+  PushEngineToDockerRegistryAsiaWithoutFloatingTag:
+    <<: *org_engine_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-engine
+    registry: fr-pre-prod-registry-asia
+  AddOrgEngineTagToSaasRepo:
+    stage: org-engine
+    title: Add org-engine git tag to saas repo
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    environment:
+    - BUILD_NUMBER_TAG=${{BUILD_NUMBER_TAG}}
+    - STATIC_TAG=${{STATIC_IMAGE_TAG}}
+    commands:
+    - apk --no-cache add curl
+    - >
+      curl "https://argo-workflows.orchestrator.forgerock.io/api/v1/events/argo/"
+      --header "Authorization:Bearer ${{ARGO_TOKEN}}"
+      --header "X-Argo-Orchestration-Git-Tag:true"
+      --data "{\"image\":\"org-engine\", \"static_tag\":\"${STATIC_TAG}\", \"build_number_tag\":\"${BUILD_NUMBER_TAG}\"}"
+    when:
+      steps:
+      - name: BuildEngineImage
+        on:
+        - success
+      branch:
+        only:
+        - /(master|regular-candidate-.*)/
+  # Run some freestyle commands to gather info for Codefresh support ticket
+  GatherDiagnosticInfo:
+    title: Gather diagnostic
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.18.3@sha256:c0c4fc904b5b79fb625fb3e3810954e3d458a542c4727aabd9959f50ee40399a
+    stage: diagnostics
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    commands:
+    - apk --no-cache add git
+    - git -P status
+    - git -P show
+    - cat /codefresh/volume/event.json || true
+    - df -h
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
