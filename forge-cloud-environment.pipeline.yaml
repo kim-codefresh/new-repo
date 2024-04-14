@@ -4,6 +4,7 @@ kind: pipeline
 metadata:
   name: ForgeCloud/saas/customer-environment
   project: ForgeCloud/saas
+  projectId: 661ba589c2557ef6bcfe600f
   isPublic: false
   labels:
     tags: []
