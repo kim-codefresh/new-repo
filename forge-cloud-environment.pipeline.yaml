@@ -5,7 +5,6 @@ metadata:
   name: ForgeCloud/saas/customer-environment
   project: ForgeCloud/saas
   projectId: 661ba589c2557ef6bcfe600f
-  revision: 3
   accountId: 642bf604797175a7ad63e335
   created_at: '2024-04-14T09:44:55.513Z'
   updated_at: '2024-04-14T09:49:58.421Z'
@@ -15,25 +14,17 @@ metadata:
     tags: []
 spec:
   triggers:
-  - name: deploy-services
+  - name: kim-codefresh/new-repo
     type: git
-    repo: ForgeCloud/saas
+    repo: kim-codefresh/new-repo
     events:
     - push
     branchRegex: "/.*/gi"
-    modifiedFilesGlob: "{3rdparty/{prometheus*,intezer,edgedelta,elasticsearch-exporter,gatekeeper,thanos,cert-manager}/**,deploy/{autoaccess/**,bin/**,terraform/**,codefresh/{customer-environment.steps.yml,auto-environment.steps.yml},docker/engine-config-test/Dockerfile,docker/util/**,kustomize/**},services/{forgecloud,org-filter}/**,*.{mod,sum},go/{common/**,services/customer/**,services/orchestration/orch-common/**,services/org-bootstrapper/**,utilities/engine-checker/**,forge/**}}"
     provider: github
-    context: github-app
-  contexts:
-  - artifactory
-  - argo-workflow-events
-  - git
-  - SysDig Access Key
-  - fr-pre-prod-registry-read-serviceaccount
-  - ea-apidocs-gcs-writer-serviceaccount
-  - prod-apidocs-gcs-writer-svcacct
-  - intezer-protect
-  - Beaus Secrets
+    context: github
+    id: 661ba59af0e9ec7f26397343
+    endpoint: 'https://sandbox-1.codefresh.io/api/providers/github/hook/foVzIHMuSV'
+    secret: TnWvBbXTg8m0iZ6w
   variables:
   - key: CF_SKIP_MAIN_CLONE
     value: 'true'
@@ -56,9 +47,5 @@ spec:
     context: github
   steps: {}
   stages: []
-  runtimeEnvironment:
-    name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefre_1
-    cpu: '24'
-    memory: 50Gi
   concurrency: 6
   branchConcurrency: 1
