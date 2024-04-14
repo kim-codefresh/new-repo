@@ -5,12 +5,14 @@ metadata:
   name: ForgeCloud/saas/customer-environment
   project: ForgeCloud/saas
   projectId: 661ba589c2557ef6bcfe600f
+  revision: 3
   accountId: 642bf604797175a7ad63e335
+  created_at: '2024-04-14T09:44:55.513Z'
+  updated_at: '2024-04-14T09:49:58.421Z'
+  shortName: customer-environment
+  deprecate: {}
   labels:
     tags: []
-  deprecate:
-    applicationPort: '8080'
-    repoPipeline: true
 spec:
   triggers:
   - name: deploy-services
