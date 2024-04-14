@@ -3,6 +3,7 @@ version: '1.0'
 kind: pipeline
 metadata:
   name: ForgeCloud/saas/customer-environment
+  project: ForgeCloud/saas
   isPublic: false
   labels:
     tags: []
