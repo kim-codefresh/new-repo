@@ -1,0 +1,60 @@
+version: '1.0'
+kind: pipeline
+metadata:
+  name: ForgeCloud/saas/customer-environment
+  isPublic: false
+  labels:
+    tags: []
+  deprecate:
+    applicationPort: '8080'
+    repoPipeline: true
+  project: ForgeCloud/saas
+spec:
+  triggers:
+  - name: deploy-services
+    type: git
+    repo: ForgeCloud/saas
+    events:
+    - push
+    branchRegex: "/.*/gi"
+    modifiedFilesGlob: "{3rdparty/{prometheus*,intezer,edgedelta,elasticsearch-exporter,gatekeeper,thanos,cert-manager}/**,deploy/{autoaccess/**,bin/**,terraform/**,codefresh/{customer-environment.steps.yml,auto-environment.steps.yml},docker/engine-config-test/Dockerfile,docker/util/**,kustomize/**},services/{forgecloud,org-filter}/**,*.{mod,sum},go/{common/**,services/customer/**,services/orchestration/orch-common/**,services/org-bootstrapper/**,utilities/engine-checker/**,forge/**}}"
+    provider: github
+    context: github-app
+  contexts:
+  - artifactory
+  - argo-workflow-events
+  - git
+  - SysDig Access Key
+  - fr-pre-prod-registry-read-serviceaccount
+  - ea-apidocs-gcs-writer-serviceaccount
+  - prod-apidocs-gcs-writer-svcacct
+  - intezer-protect
+  - Beaus Secrets
+  variables:
+  - key: CF_SKIP_MAIN_CLONE
+    value: 'true'
+  - key: FLOATING_IMAGE_TAG
+    value: "${{CF_BRANCH_TAG_NORMALIZED}}"
+  - key: STATIC_IMAGE_TAG
+    value: "${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_REVISION}}"
+  # FRAAS-13149: To remove this requirement
+  - key: SKIP_IDENTITY_STACK_CHECK
+    value: "false"
+    # value: https://${{ARTIFACTORY_USERNAME}}:${{ARTIFACTORY_API_KEY}}@maven.forgerock.org/artifactory/api/go/go-virtual,https://proxy.golang.org
+    # This pipeline is optimized to only build Docker images deployed by org-engine if their source has changed;
+    # use the following variables to force a given stage. Default is not to force a stage unless a change has been detected.
+    # - key: FORCE_BUILD_<STAGE_NAME> (eg FORCE_BUILD_ORG_ENGINE)
+    #   value: "true"
+  specTemplate:
+    location: git
+    repo: ForgeCloud/saas
+    path: deploy/codefresh/customer-environment.steps.yml
+    context: github-app
+  steps: {}
+  stages: []
+  runtimeEnvironment:
+    name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefre_1
+    cpu: '24'
+    memory: 50Gi
+  concurrency: 6
+  branchConcurrency: 1
