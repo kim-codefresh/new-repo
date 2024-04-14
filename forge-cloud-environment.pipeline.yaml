@@ -2,59 +2,97 @@ version: '1.0'
 kind: pipeline
 metadata:
   name: ForgeCloud/saas/customer-environment
-  isPublic: false
+  project: ForgeCloud/saas
+  projectId: 661ba589c2557ef6bcfe600f
+  revision: 3
+  accountId: 642bf604797175a7ad63e335
+  created_at: '2024-04-14T09:44:55.513Z'
+  updated_at: '2024-04-14T09:49:58.421Z'
+  shortName: customer-environment
+  deprecate: {}
   labels:
     tags: []
-  deprecate:
-    applicationPort: '8080'
-    repoPipeline: true
-  project: ForgeCloud/saas
+  originalYamlString: |+
+    # More examples of Codefresh YAML can be found at
+    # https://codefresh.io/docs/docs/yaml-examples/examples/
+
+    version: "1.0"
+    # Stages can help you organize your steps in stages
+    stages:
+      - "clone"
+      - "build"
+      - "test"
+
+    steps:
+      clone:
+        title: "Cloning repository"
+        type: "git-clone"
+        repo: "kim-codefresh/new-repo"
+        # CF_BRANCH value is auto set when pipeline is triggered
+        # Learn more at codefresh.io/docs/docs/codefresh-yaml/variables/
+        revision: "${{CF_BRANCH}}"
+        git: "github"
+        stage: "clone"
+
+      test:
+        title: "Running test"
+        type: "freestyle" # Run any command
+        image: "ubuntu:latest" # The image in which command will be executed
+        working_directory: "${{clone}}" # Running command where code cloned
+        commands:
+          - "ls"
+        stage: "test"
+
+  id: 661ba597c2557ef6bcfe6010
 spec:
   triggers:
-  - name: deploy-services
-    type: git
-    repo: ForgeCloud/saas
-    events:
-    - push
-    branchRegex: "/.*/gi"
-    modifiedFilesGlob: "{3rdparty/{prometheus*,intezer,edgedelta,elasticsearch-exporter,gatekeeper,thanos,cert-manager}/**,deploy/{autoaccess/**,bin/**,terraform/**,codefresh/{customer-environment.steps.yml,auto-environment.steps.yml},docker/engine-config-test/Dockerfile,docker/util/**,kustomize/**},services/{forgecloud,org-filter}/**,*.{mod,sum},go/{common/**,services/customer/**,services/orchestration/orch-common/**,services/org-bootstrapper/**,utilities/engine-checker/**,forge/**}}"
-    provider: github
-    context: github-app
-  contexts:
-  - artifactory
-  - argo-workflow-events
-  - git
-  - SysDig Access Key
-  - fr-pre-prod-registry-read-serviceaccount
-  - ea-apidocs-gcs-writer-serviceaccount
-  - prod-apidocs-gcs-writer-svcacct
-  - intezer-protect
-  - Beaus Secrets
-  variables:
-  - key: CF_SKIP_MAIN_CLONE
-    value: 'true'
-  - key: FLOATING_IMAGE_TAG
-    value: "${{CF_BRANCH_TAG_NORMALIZED}}"
-  - key: STATIC_IMAGE_TAG
-    value: "${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_REVISION}}"
-  # FRAAS-13149: To remove this requirement
-  - key: SKIP_IDENTITY_STACK_CHECK
-    value: "false"
-    # value: https://${{ARTIFACTORY_USERNAME}}:${{ARTIFACTORY_API_KEY}}@maven.forgerock.org/artifactory/api/go/go-virtual,https://proxy.golang.org
-    # This pipeline is optimized to only build Docker images deployed by org-engine if their source has changed;
-    # use the following variables to force a given stage. Default is not to force a stage unless a change has been detected.
-    # - key: FORCE_BUILD_<STAGE_NAME> (eg FORCE_BUILD_ORG_ENGINE)
-    #   value: "true"
+    - name: kim-codefresh/new-repo
+      type: git
+      repo: kim-codefresh/new-repo
+      events:
+        - push.heads
+      pullRequestAllowForkEvents: false
+      commentRegex: /.*/gi
+      branchRegex: /.*/gi
+      branchRegexInput: regex
+      gerritCIStatusLabels: []
+      provider: github
+      disabled: false
+      options:
+        noCache: false
+        noCfCache: false
+        resetVolume: false
+      context: github
+      contexts: []
+      verified: true
+      status: verified
+      id: 661ba59af0e9ec7f26397343
+      endpoint: 'https://sandbox-1.codefresh.io/api/providers/github/hook/foVzIHMuSV'
+      secret: TnWvBbXTg8m0iZ6w
+  clustersInfo:
+    injectAll: true
+  variables: []
+  contexts: []
   specTemplate:
     location: git
     repo: kim-codefresh/pipelines
-    path: customer-environment.steps.yml
-    context: github-app
-  steps: {}
+    path: ./customer-environment.steps.yml
+    revision: main
+    context: github
+  steps:
+    clone:
+      title: Cloning repository
+      type: git-clone
+      repo: kim-codefresh/new-repo
+      revision: '${{CF_BRANCH}}'
+      git: github
+      stage: clone
+    test:
+      title: Running test
+      type: freestyle
+      image: 'ubuntu:latest'
+      working_directory: '${{clone}}'
+      commands:
+        - ls
+      stage: test
   stages: []
-  runtimeEnvironment:
-    name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefre_1
-    cpu: '24'
-    memory: 50Gi
-  concurrency: 6
-  branchConcurrency: 1
