@@ -51,7 +51,7 @@ spec:
     location: git
     repo: kim-codefresh/pipelines
     path: customer-environment.steps.yml
-    context: github-app
+    context: github
   steps: {}
   stages: []
   runtimeEnvironment:
