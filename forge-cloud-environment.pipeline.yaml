@@ -9,7 +9,7 @@ metadata:
   deprecate:
     applicationPort: '8080'
     repoPipeline: true
-  project: ForgeCloud/saas
+  project: ForgeCloud/saasד
 spec:
   triggers:
   - name: deploy-servicesד
