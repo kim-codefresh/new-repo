@@ -12,7 +12,7 @@ metadata:
   project: ForgeCloud/saas
 spec:
   triggers:
-  - name: deploy-services
+  - name: deploy-servicesד
     type: git
     repo: kim-codefresh/pipelines
     events:
@@ -49,7 +49,7 @@ spec:
     ,services/thanos/**\
     }"
     provider: github
-    context: github-1
+    context: github-11
   contexts:
   - kim-codefresh
   variables:
@@ -67,7 +67,7 @@ spec:
     location: git
     repo: kim-codefresh/pipelines
     path: customer-environment.steps.yml
-    context: github
+    context: github-1
   steps: {}
   stages: []
   concurrency: 6
