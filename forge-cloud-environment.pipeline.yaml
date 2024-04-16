@@ -12,7 +12,7 @@ metadata:
   project: ForgeCloud/saasד
 spec:
   triggers:
-  - name: deploy-servicesד
+  - name: deploy-services
     type: git
     repo: kim-codefresh/pipelines
     events:
