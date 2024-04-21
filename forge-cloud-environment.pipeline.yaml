@@ -30,7 +30,7 @@ spec:
       modifiedFilesGlob: >-
         {,deploy/autoaccess/**,deploy/bin/**,deploy/codefresh/*.ce.steps.yml,deploy/codefresh/auto-environment.steps.yml,deploy/codefresh/customer-environment.steps.yml,deploy/docker/fbc-tools/**,deploy/docker/util/**,deploy/kustomize/**,deploy/terraform/**,go.{mod,sum},go/common/**,tools/forge/**,go/services/customer/**,go/services/orchestration/orch-common/**,go/services/org-bootstrapper/**,go/utilities/engine-checker/**,services/cert-manager/**,services/edgedelta/**,services/elasticsearch-exporter/**,services/forgecloud/**,services/gatekeeper/**,services/haproxy/**,services/intezer/**,services/kube-state-metrics/**,services/org-filter/**,services/org-log-spewer/**,services/prometheus*/**,services/thanos/**}
       provider: github
-      context: github-app
+      context: github
       lastExecutionDate: '2024-04-15T08:30:52.990Z'
       verified: true
       status: verified
