@@ -52,7 +52,7 @@ spec:
     context: github
   stages: []
   runtimeEnvironment:
-    name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefresh
+    name: arn:aws:eks:us-east-1:454353560595:cluster/kim/sandbox-1-runner
     cpu: 6000m
     memory: 8000Mi
   concurrency: 6
