@@ -67,7 +67,7 @@ spec:
     location: git
     repo: kim-codefresh/pipelines
     path: ./customer-environment.steps.yml
-    context: github-1
+    context: github
   steps: {}
   stages: []
   concurrency: 6
