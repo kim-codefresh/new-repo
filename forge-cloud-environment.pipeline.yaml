@@ -51,10 +51,10 @@ spec:
     path: customer-environment.steps.yml
     context: github
   stages: []
-  runtimeEnvironment:
-    name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefresh
-    cpu: 6000m
-    memory: 8000Mi
+  # runtimeEnvironment:
+  #   name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefresh
+  #   cpu: 6000m
+  #   memory: 8000Mi
   concurrency: 6
   branchConcurrency: 1
   steps: {}
