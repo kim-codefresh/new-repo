@@ -1,4 +1,3 @@
----
 version: '1.0'
 kind: pipeline
 metadata:
@@ -9,66 +8,55 @@ metadata:
   deprecate:
     applicationPort: '8080'
     repoPipeline: true
-  project: ForgeCloud/saassdfsfddf
+    implicitGitCloneService:
+      scm:
+        provider: github
+        owner:
+          name: kim-codefresh
+        name: saas
+      context: github
+  project: ForgeCloud/saas
+  created_at: '2019-07-02T14:43:13.277Z'
+  updated_at: '2024-04-14T07:12:04.467Z'
+  shortName: customer-environment
 spec:
   triggers:
-  - name: deploy-services
-    type: git
-    repo: kim-codefresh/pipelines
-    events:
-    - push
-    branchRegex: "/.*/gi"
-    modifiedFilesGlob: "{\
-    ,deploy/autoaccess/**\
-    ,deploy/bin/**\
-    ,deploy/codefresh/*.ce.steps.yml\
-    ,deploy/codefresh/auto-environment.steps.yml\
-    ,deploy/codefresh/customer-environment.steps.yml\
-    ,deploy/docker/fbc-tools/**\
-    ,deploy/docker/util/**\
-    ,deploy/kustomize/**\
-    ,deploy/terraform/**\
-    ,go.{mod,sum}\
-    ,go/common/**\
-    ,tools/forge/**\
-    ,go/services/customer/**\
-    ,go/services/orchestration/orch-common/**\
-    ,go/services/org-bootstrapper/**\
-    ,go/utilities/engine-checker/**\
-    ,services/cert-manager/**\
-    ,services/edgedelta/**\
-    ,services/elasticsearch-exporter/**\
-    ,services/forgecloud/**\
-    ,services/gatekeeper/**\
-    ,services/haproxy/**\
-    ,services/intezer/**\
-    ,services/kube-state-metrics/**\
-    ,services/org-filter/**\
-    ,services/org-log-spewer/**\
-    ,services/prometheus*/**\
-    ,services/thanos/**\
-    }"
-    provider: github
-    context: github-11
+    - name: deploy-services
+      type: git
+      repo: ForgeCloud/saas
+      events:
+        - push
+      branchRegex: /.*/gi
+      modifiedFilesGlob: >-
+        {,deploy/autoaccess/**,deploy/bin/**,deploy/codefresh/*.ce.steps.yml,deploy/codefresh/auto-environment.steps.yml,deploy/codefresh/customer-environment.steps.yml,deploy/docker/fbc-tools/**,deploy/docker/util/**,deploy/kustomize/**,deploy/terraform/**,go.{mod,sum},go/common/**,tools/forge/**,go/services/customer/**,go/services/orchestration/orch-common/**,go/services/org-bootstrapper/**,go/utilities/engine-checker/**,services/cert-manager/**,services/edgedelta/**,services/elasticsearch-exporter/**,services/forgecloud/**,services/gatekeeper/**,services/haproxy/**,services/intezer/**,services/kube-state-metrics/**,services/org-filter/**,services/org-log-spewer/**,services/prometheus*/**,services/thanos/**}
+      provider: github
+      context: github-app
+      lastExecutionDate: '2024-04-15T08:30:52.990Z'
+      verified: true
+      status: verified
+      endpoint: 'https://g.codefresh.io/api/providers/github/hook/YYkig1kMMy'
+      secret: a6Q47tS4y1seObn2
   contexts:
-  - kim-codefresh
+    - github
   variables:
-  - key: CF_SKIP_MAIN_CLONE
-    value: 'true'
-  - key: FLOATING_IMAGE_TAG
-    value: "${{CF_BRANCH_TAG_NORMALIZED}}"
-  - key: STATIC_IMAGE_TAG
-    value: "${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_REVISION}}"
-    # This pipeline is optimized to only build Docker images deployed by org-engine if their source has changed;
-    # use the following variables to force a given stage. Default is not to force a stage unless a change has been detected.
-    # - key: FORCE_BUILD_<STAGE_NAME> (eg FORCE_BUILD_ORG_ENGINE)
-    #   value: "true"
+    - key: CF_SKIP_MAIN_CLONE
+      value: 'true'
+    - key: FLOATING_IMAGE_TAG
+      value: '${{CF_BRANCH_TAG_NORMALIZED}}'
+    - key: STATIC_IMAGE_TAG
+      value: '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_REVISION}}'
   specTemplate:
     location: git
-    repo: kim-codefresh/pipelines
-    path: ./customer-environment.steps.yml
+    repo: ForgeCloud/saas
+    path: customer-environment.steps.yml
     context: github
-  steps: {}
   stages: []
+  # runtimeEnvironment:
+  #   name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefresh
+  #   cpu: 6000m
+  #   memory: 8000Mi
   concurrency: 6
   branchConcurrency: 1
+  steps: {}
+  clustersInfo:
+    injectAll: true
