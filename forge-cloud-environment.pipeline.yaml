@@ -51,10 +51,10 @@ spec:
     path: customer-environment.steps.yml
     context: github
   stages: []
-  runtimeEnvironment:
-    name: arn:aws:eks:us-east-1:454353560595:cluster/kim/sandbox-1-runne
-    cpu: 6000m
-    memory: 8000Mi
+  # runtimeEnvironment:
+    # name: arn:aws:eks:us-east-1:454353560595:cluster/kim/sandbox-1-runner
+    # cpu: 6000m
+    # memory: 8000Mi
   concurrency: 6
   branchConcurrency: 1
   steps: {}
