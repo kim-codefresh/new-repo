@@ -7,18 +7,13 @@ metadata:
     tags: []
   deprecate:
     applicationPort: '8080'
-    repoPipeline: true
-    implicitGitCloneService:
-      scm:
-        provider: github
-        owner:
-          name: kim-codefresh
-        name: saas
-      context: github
   project: ForgeCloud/saas
-  created_at: '2019-07-02T14:43:13.277Z'
-  updated_at: '2024-04-14T07:12:04.467Z'
+  created_at: '2024-04-18T13:23:39.740Z'
+  updated_at: '2024-05-01T08:45:26.928Z'
   shortName: customer-environment
+  projectId: 66211eb536130bc0f5f5b6a5
+  accountId: 6107f96b1895b556b7835b26
+  id: 66211edbc5dc6eb292837bd8
 spec:
   triggers:
     - name: deploy-services
@@ -31,11 +26,9 @@ spec:
         {,deploy/autoaccess/**,deploy/bin/**,deploy/codefresh/*.ce.steps.yml,deploy/codefresh/auto-environment.steps.yml,deploy/codefresh/customer-environment.steps.yml,deploy/docker/fbc-tools/**,deploy/docker/util/**,deploy/kustomize/**,deploy/terraform/**,go.{mod,sum},go/common/**,tools/forge/**,go/services/customer/**,go/services/orchestration/orch-common/**,go/services/org-bootstrapper/**,go/utilities/engine-checker/**,services/cert-manager/**,services/edgedelta/**,services/elasticsearch-exporter/**,services/forgecloud/**,services/gatekeeper/**,services/haproxy/**,services/intezer/**,services/kube-state-metrics/**,services/org-filter/**,services/org-log-spewer/**,services/prometheus*/**,services/thanos/**}
       provider: github
       context: github
-      lastExecutionDate: '2024-04-15T08:30:52.990Z'
       verified: true
       status: verified
-      endpoint: 'https://g.codefresh.io/api/providers/github/hook/YYkig1kMMy'
-      secret: a6Q47tS4y1seObn2
+      id: 66212374c5dc6eb292837bd9
   contexts:
     - github
   variables:
@@ -52,11 +45,12 @@ spec:
     context: github
   stages: []
   runtimeEnvironment:
-    name: kim-helm-runner
-    cpu: 6000m
-    memory: 8000Mi
+    name: kim-codefresh/kim-helm-runner
+    cpu: 600m
+    memory: 800Mi
   concurrency: 6
   branchConcurrency: 1
-  steps: {}
   clustersInfo:
     injectAll: true
+  steps: {}
+
