@@ -52,9 +52,9 @@ spec:
     context: github
   stages: []
   runtimeEnvironment:
-    name: kim-codefresh/kim-helm-runnerr
-    cpu: 6000m
-    memory: 8000Mi
+    name: kim-codefresh/kim-helm-runner
+    cpu: 600m
+    memory: 800Mi
   concurrency: 6
   branchConcurrency: 1
   steps: {}
