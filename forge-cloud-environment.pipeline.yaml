@@ -20,10 +20,18 @@ spec:
       type: git
       repo: ForgeCloud/saas
       events:
-        - push
+        - push.heads
+      pullRequestAllowForkEvents: false
+      commentRegex: /.*/gi
       branchRegex: /.*/gi
-      modifiedFilesGlob: >-
-        {,deploy/autoaccess/**,deploy/bin/**,deploy/codefresh/*.ce.steps.yml,deploy/codefresh/auto-environment.steps.yml,deploy/codefresh/customer-environment.steps.yml,deploy/docker/fbc-tools/**,deploy/docker/util/**,deploy/kustomize/**,deploy/terraform/**,go.{mod,sum},go/common/**,tools/forge/**,go/services/customer/**,go/services/orchestration/orch-common/**,go/services/org-bootstrapper/**,go/utilities/engine-checker/**,services/cert-manager/**,services/edgedelta/**,services/elasticsearch-exporter/**,services/forgecloud/**,services/gatekeeper/**,services/haproxy/**,services/intezer/**,services/kube-state-metrics/**,services/org-filter/**,services/org-log-spewer/**,services/prometheus*/**,services/thanos/**}
+      branchRegexInput: regex
+      gerritCIStatusLabels: []
+      provider: github
+      disabled: false
+      options:
+        noCache: false
+        noCfCache: false
+        resetVolume: false
       provider: github
       context: github-22
       verified: true
