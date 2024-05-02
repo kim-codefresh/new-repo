@@ -47,7 +47,8 @@ spec:
     context: github-1
   stages: []
   runtimeEnvironment:
-    name: kim-codefresh/kim-helm-runner
+    # name: kim-codefresh/kim-helm-runner
+    name: arn:aws:eks:us-east-1:454353560595:cluster/kim/local-runner
     cpu: 600m
     memory: 800Mi
   concurrency: 6
