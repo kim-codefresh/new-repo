@@ -31,6 +31,8 @@ spec:
       id: 66212374c5dc6eb292837bd9
   contexts:
     - github
+    - sdf
+    - skwl
   variables:
     - key: CF_SKIP_MAIN_CLONE
       value: 'true'
