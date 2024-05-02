@@ -29,6 +29,7 @@ spec:
       verified: true
       status: verified
       id: 66212374c5dc6eb292837bd9
+      endpoint: 'https://g.codefresh.io/api/providers/github/hook/YYkig1kMMy'
   contexts:
     - github
     - sdf
