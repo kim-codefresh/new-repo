@@ -26,7 +26,6 @@ spec:
       branchRegex: /.*/gi
       branchRegexInput: regex
       gerritCIStatusLabels: []
-      provider: github
       disabled: false
       options:
         noCache: false
