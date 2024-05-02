@@ -44,7 +44,7 @@ spec:
     location: git
     repo: ForgeCloud/saas
     path: customer-environment.steps.yml
-    context: github
+    context: github-1
   stages: []
   runtimeEnvironment:
     name: kim-codefresh/kim-helm-runner
