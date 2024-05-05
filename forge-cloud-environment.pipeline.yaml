@@ -12,7 +12,7 @@ metadata:
   updated_at: '2024-05-01T08:45:26.928Z'
   shortName: customer-environment
   projectId: 66211eb536130bc0f5f5b6a5
-  accountId: 6107f96b1895b556b7835b26
+  # accountId: 6107f96b1895b556b7835b26
   id: 66211edbc5dc6eb292837bd8
 spec:
   triggers:
