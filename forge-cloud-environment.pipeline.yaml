@@ -14,7 +14,7 @@ metadata:
         owner:
           name: ForgeCloud
         name: saas
-      context: github-fr-saas-codefresh
+      context: github-kim
   project: ForgeCloud/saas
   projectId: 66cdbdd70b95e30a6fb91020 #66211eb536130bc0f5f5b6a5
   accountId: 6425a74b599a41442fe43196 #66211edbc5dc6eb292837bd8
@@ -87,10 +87,10 @@ spec:
     path: deploy/codefresh/customer-environment.steps.yml
     context: github-app
   stages: []
-  runtimeEnvironment:
-    name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefresh
-    cpu: 6000m
-    memory: 8000Mi
+  # runtimeEnvironment:
+  #   name: gke_terraforged-6c798352-d8c8_us-west1-a_cicd-runners/codefresh
+  #   cpu: 6000m
+  #   memory: 8000Mi
   concurrency: 6
   branchConcurrency: 1
   steps: {}
