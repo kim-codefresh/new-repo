@@ -14,10 +14,10 @@ FROM ghcr.io/jqlang/jq:${JQ_VERSION} as jq
 FROM alpine:latest
 
 # Copy binaries from previous stages
-COPY --from=curl /usr/bin/curl /usr/bin/curl
-COPY --from=argo-wf /usr/local/bin/argo /usr/local/bin/argo
-COPY --from=argo-cd /usr/local/bin/argocd /usr/local/bin/argocd
-COPY --from=jq /usr/local/bin/jq /usr/local/bin/jq
+COPY --from=curl /bin/curl /usr/bin/curl
+COPY --from=argo-wf /bin/argo /usr/local/bin/argo
+COPY --from=argo-cd /bin/argocd /usr/local/bin/argocd
+COPY --from=jq /bin/jq /usr/local/bin/jq
 
 # Set up minimal environment
 RUN apk add --no-cache ca-certificates && \
