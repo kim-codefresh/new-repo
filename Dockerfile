@@ -1,18 +1,14 @@
-# Base image
-FROM alpine:3.15.0
+# Define versions for tools
+ARG CURL_VERSION=8.11.0
+ARG ARGO_WF_VERSION=v3.6.2
+ARG ARGO_CD_VERSION=v2.13.1
+ARG JQ_VERSION=1.7.1
 
-# Argo Workflows CLI arguments
-ARG ARGO_WORKFLOWS_CLI_VERSION=v3.2.6
-ARG TARGETARCH=amd64
+# Pull tools from respective images
+FROM quay.io/curl/curl-base:${CURL_VERSION} as curl
+FROM quay.io/argoproj/argocli:${ARGO_WF_VERSION} as argo-wf
+FROM quay.io/argoproj/argocd:${ARGO_CD_VERSION} as argo-cd
+FROM ghcr.io/jqlang/jq:${JQ_VERSION} as jq
 
-# Argo CD CLI argument
-ARG ARGOCD_CLI_VERSION=v2.1.7
-
-# Install necessary packages and CLI tools
-RUN apk add --no-cache ca-certificates curl jq \
-    && curl -sSL -o argo.gz https://github.com/argoproj/argo-workflows/releases/download/$ARGO_WORKFLOWS_CLI_VERSION/argo-linux-${TARGETARCH}.gz \
-    && gunzip argo.gz \
-    && chmod +x argo \
-    && mv argo /usr/local/bin/argo \
-    && curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/$ARGOCD_CLI_VERSION/argocd-linux-amd64 \
-    && chmod +x /usr/local/bin/argocd
+# Final stage
+FROM alpine:latest
