@@ -17,10 +17,10 @@ FROM alpine:latest
 COPY --from=curl /usr/bin/curl /usr/bin/curl
 COPY --from=argo-wf /bin/argo /bin/argo
 COPY --from=argo-cd /usr/local/bin/argocd /usr/local/bin/argocd
-COPY --from=jq /usr/bin/jq /usr/bin/jq
+COPY --from=jq /usr/local/bin/jq /usr/local/bin/jq
 
 # Set up minimal environment
 RUN apk add --no-cache ca-certificates && \
-    chmod +x /usr/bin/curl /bin/argo /usr/bin/argocd /usr/bin/jq
+    chmod +x /usr/bin/curl /bin/argo /usr/bin/argocd /usr/local/bin/jq
 
 
