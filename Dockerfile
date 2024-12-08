@@ -19,8 +19,8 @@ COPY --from=argo-wf /bin/argo /usr/local/bin/argo
 COPY --from=argo-cd /usr/local/bin/argocd /usr/local/bin/argocd
 COPY --from=jq /jq /usr/local/bin/jq
 
-# Set up minimal environment
-RUN apk add --no-cache ca-certificates && \
-    chmod +x /usr/local/bin/curl /usr/local/bin/argo /usr/local/bin/argocd /usr/local/bin/jq
+RUN apt-get update && apt-get install -y ca-certificates && \
+    chmod +x /usr/local/bin/curl /usr/local/bin/argo /usr/local/bin/argocd /usr/local/bin/jq && \
+    apt-get clean
 
 
