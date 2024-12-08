@@ -11,7 +11,7 @@ FROM quay.io/argoproj/argocd:${ARGO_CD_VERSION} as argo-cd
 FROM ghcr.io/jqlang/jq:${JQ_VERSION} as jq
 
 # Final stage
-FROM alpine:latest
+FROM debian:latest
 
 # Copy binaries from previous stages
 COPY --from=curl /usr/bin/curl /usr/local/bin/curl
