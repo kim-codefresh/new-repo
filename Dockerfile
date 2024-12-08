@@ -18,8 +18,7 @@ COPY --from=argo-wf /bin/argo /usr/local/bin/argo
 COPY --from=argo-cd /usr/local/bin/argocd /usr/local/bin/argocd
 COPY --from=jq /jq /usr/local/bin/jq
 
-RUN apt-get update && apt-get install -y ca-certificates && \
-    chmod +x /usr/local/bin/argo /usr/local/bin/argocd /usr/local/bin/jq && \
-    apt-get clean
+RUN apk add --no-cache ca-certificates && \
+    chmod +x /usr/local/bin/argo /usr/local/bin/argocd /usr/local/bin/jq
 
 
